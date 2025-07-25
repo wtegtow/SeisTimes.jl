@@ -65,113 +65,6 @@ function solve_christoffel!(VpVs::MVector{2,Float64}, UpUs::MMatrix{2,2,Float64}
     UpUs[:,2] .= U[:,1]         
 end
 
-function compute_viscosities(solid::Solid2D; deg_increment=3, buffer_factor=2)
-
-    C = ([ (solid.c11[i,k], 
-            solid.c13[i,k], 
-            solid.c33[i,k], 
-            solid.c55[i,k]) 
-            for i in axes(solid.c11,1), k in axes(solid.c11,2)
-        ])
-                        
-    unique_C = unique(C)
-    indices_C = [findfirst(==(val), C) for val in unique_C]
-    n_unique_C = length(unique_C)
-
-    angles_theta = deg2rad.(0:deg_increment:360)
-    n_theta = length(angles_theta)
-
-    visc_p = zeros(n_unique_C, n_theta, 2);
-    visc_s = zeros(n_unique_C, n_theta, 2);
-
-    VpVs = MVector{2,Float64}(undef)
-    UpUs = MMatrix{2,2,Float64}(undef)
-
-    for c in 1:n_unique_C
-        c_idx = indices_C[c]
-        
-        for (theta_idx, theta) in enumerate(angles_theta)
-
-            n = SVector(cos(theta), sin(theta))
-            n = n/norm(n)
-
-            solve_christoffel!(VpVs, UpUs, solid, n, c_idx[1], c_idx[2])
-
-            Pp = n ./ VpVs[1]
-            Ps = n ./ VpVs[2]
-
-            ΓUp = Γn(solid, UpUs[:,1], c_idx[1], c_idx[2])
-            ΓUs = Γn(solid, UpUs[:,2], c_idx[1], c_idx[2])
-
-            @einsum gp[i] := ΓUp[i,j] * Pp[j]
-            @einsum gs[i] := ΓUs[i,j] * Ps[j]
-            @test dot(gp,Pp) ≈ 1 rtol=1e-3
-            @test dot(gs,Ps) ≈ 1 rtol=1e-3
-
-            ∂H∂P = -gp ./ VpVs[1]
-            ∂H∂S = -gs ./ VpVs[2]
-
-            visc_p[c,theta_idx,:] .= abs.(∂H∂P) .* buffer_factor
-            visc_s[c,theta_idx,:] .= abs.(∂H∂S) .* buffer_factor
-
-        end
-    end
-
-    visc_p = Float64[maximum(visc_p[:,:,1]), maximum(visc_p[:,:,2])]
-    visc_s = Float64[maximum(visc_s[:,:,1]), maximum(visc_s[:,:,2])]
-    return visc_p, visc_s;
-end;
-
-
-function inject_sources!(solid::Solid2D, T, source_mask, sources, scheme, wavemode, nx, nz, dx, dz) 
-
-    if scheme == :LxFS1 
-        for (sx, sz) in sources
-            T[sx, sz] = 0.
-            source_mask[sx, sz] = true
-        end
-    
-    elseif scheme == :LxFS3 || scheme == :LxFS5
-
-        cell_size = scheme == :LxFS3 ? 1 : 2
-        VpVs1 = MVector{2,Float64}(undef)
-        UpUs1 = MMatrix{2,2,Float64}(undef)
-        VpVs2 = MVector{2,Float64}(undef)
-        UpUs2 = MMatrix{2,2,Float64}(undef)
-
-        for (sx, sz) in sources
-            for i in clamp(sx-cell_size, 1, nx):clamp(sx+cell_size, 1, nx)
-                for k in clamp(sz-cell_size, 1, nz):clamp(sz+cell_size, 1, nz)
-
-                    source_mask[i, k] = true 
-                    if (i,k) == (sx, sz)
-                        T[i, k] = 0.
-                    else 
-                        
-                        dxi = i - sx
-                        dzi = k - sz
-
-                        n = SVector(dxi, dzi) / sqrt(dxi^2 +dzi^2)
-                        r = sqrt((dxi * dx)^2 + (dzi * dz)^2)
-                        solve_christoffel!(VpVs1, UpUs1, solid, n, i, k)
-                        solve_christoffel!(VpVs2, UpUs2, solid, n, sx, sz)
-
-                        # This might be not very accurate for strong heterogenities around the source
-                        if wavemode == :P 
-                            T[i,k] = r / ((VpVs1[1] + VpVs2[1])/2)
-                        elseif wavemode == :S 
-                            T[i,k] = r / ((VpVs1[2] + VpVs2[2])/2)
-                        end
-                       
-                    end
-                end 
-            end
-        end
-    else
-        error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
-    end
-
-end
 
 function LxFS1(T, i, k, dx, dz)
     return SVector(T[i+1,k], T[i-1,k],  T[i,k+1],  T[i,k-1])
@@ -280,6 +173,112 @@ function ΦWENO(a,b,c,d)
     return ϕweno
 end
 
+function compute_viscosities(solid::Solid2D; deg_increment=3, buffer_factor=2)
+
+    C = ([ (solid.c11[i,k], 
+            solid.c13[i,k], 
+            solid.c33[i,k], 
+            solid.c55[i,k]) 
+            for i in axes(solid.c11,1), k in axes(solid.c11,2)
+        ])
+                        
+    unique_C = unique(C)
+    indices_C = [findfirst(==(val), C) for val in unique_C]
+    n_unique_C = length(unique_C)
+
+    angles_theta = deg2rad.(0:deg_increment:360)
+    n_theta = length(angles_theta)
+
+    visc_p = zeros(n_unique_C, n_theta, 2);
+    visc_s = zeros(n_unique_C, n_theta, 2);
+
+    VpVs = MVector{2,Float64}(undef)
+    UpUs = MMatrix{2,2,Float64}(undef)
+
+    for c in 1:n_unique_C
+        c_idx = indices_C[c]
+        
+        for (theta_idx, theta) in enumerate(angles_theta)
+
+            n = SVector(cos(theta), sin(theta))
+            n = n/norm(n)
+
+            solve_christoffel!(VpVs, UpUs, solid, n, c_idx[1], c_idx[2])
+
+            Pp = n ./ VpVs[1]
+            Ps = n ./ VpVs[2]
+
+            ΓUp = Γn(solid, UpUs[:,1], c_idx[1], c_idx[2])
+            ΓUs = Γn(solid, UpUs[:,2], c_idx[1], c_idx[2])
+
+            @einsum gp[i] := ΓUp[i,j] * Pp[j]
+            @einsum gs[i] := ΓUs[i,j] * Ps[j]
+            @test dot(gp,Pp) ≈ 1 rtol=1e-3
+            @test dot(gs,Ps) ≈ 1 rtol=1e-3
+
+            ∂H∂P = -gp ./ VpVs[1]
+            ∂H∂S = -gs ./ VpVs[2]
+
+            visc_p[c,theta_idx,:] .= abs.(∂H∂P) .* buffer_factor
+            visc_s[c,theta_idx,:] .= abs.(∂H∂S) .* buffer_factor
+
+        end
+    end
+
+    visc_p = Float64[maximum(visc_p[:,:,1]), maximum(visc_p[:,:,2])]
+    visc_s = Float64[maximum(visc_s[:,:,1]), maximum(visc_s[:,:,2])]
+    return visc_p, visc_s;
+end;
+
+function inject_sources!(solid::Solid2D, T, source_mask, sources, scheme, wavemode, nx, nz, dx, dz) 
+
+    if scheme == :LxFS1 
+        for (sx, sz) in sources
+            T[sx, sz] = 0.
+            source_mask[sx, sz] = true
+        end
+    
+    elseif scheme == :LxFS3 || scheme == :LxFS5
+
+        cell_size = scheme == :LxFS3 ? 1 : 2
+        VpVs1 = MVector{2,Float64}(undef)
+        UpUs1 = MMatrix{2,2,Float64}(undef)
+        VpVs2 = MVector{2,Float64}(undef)
+        UpUs2 = MMatrix{2,2,Float64}(undef)
+
+        for (sx, sz) in sources
+            for i in clamp(sx-cell_size, 1, nx):clamp(sx+cell_size, 1, nx)
+                for k in clamp(sz-cell_size, 1, nz):clamp(sz+cell_size, 1, nz)
+
+                    source_mask[i, k] = true 
+                    if (i,k) == (sx, sz)
+                        T[i, k] = 0.
+                    else 
+                        
+                        dxi = i - sx
+                        dzi = k - sz
+
+                        n = SVector(dxi, dzi) / sqrt(dxi^2 +dzi^2)
+                        r = sqrt((dxi * dx)^2 + (dzi * dz)^2)
+                        solve_christoffel!(VpVs1, UpUs1, solid, n, i, k)
+                        solve_christoffel!(VpVs2, UpUs2, solid, n, sx, sz)
+
+                        # This might be not very accurate for strong heterogenities around the source
+                        if wavemode == :P 
+                            T[i,k] = r / ((VpVs1[1] + VpVs2[1])/2)
+                        elseif wavemode == :S 
+                            T[i,k] = r / ((VpVs1[2] + VpVs2[2])/2)
+                        end
+                       
+                    end
+                end 
+            end
+        end
+    else
+        error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
+    end
+
+end
 
 function calc_time!(solid::Solid2D, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, k, dx, dz)
 
@@ -344,10 +343,6 @@ function fast_sweep(solid::Solid2D,
 
     # calculate artificial viscosities
     visc_p, visc_s = compute_viscosities(solid; buffer_factor=viscosity_buffer);
-    if verbose 
-        println("P - Viscosities: ", visc_p)
-        println("S - Viscosities: ", visc_s)
-    end 
 
     # select wavemode
     if wavemode == :P 
@@ -394,10 +389,18 @@ function fast_sweep(solid::Solid2D,
     L2_error = INF
     L∞_error = INF
 
+    if verbose 
+        println("===============================================")
+        println("Compute Traveltimes: $(wavemode)")
+        @printf("Grid Size: %d, %d\n", nx, nz)
+        @printf("Viscosities: %.2e | %.2e \n", viscosities[1], viscosities[2])
+        println("===============================================")
+    end 
+
     for iter in 1:max_iter
 
         if verbose
-        @printf("Iter: %4d | L2: %.5e | L∞: %.5e\n", iter, L2_error, L∞_error)
+        @printf("Iter: %5d | L2: %.5e | L∞: %.5e\n", iter, L2_error, L∞_error)
         end
 
         @inbounds begin 
