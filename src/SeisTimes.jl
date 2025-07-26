@@ -679,7 +679,7 @@ function compute_viscosities(solid::Solid3D; deg_increment=3, buffer_factor=2)
                 n = SVector(sin(phi)*cos(theta), sin(phi)*sin(theta), cos(phi))
                 n = n/norm(n)
 
-                solve_christoffel!(VpVs, UpUs, solid, n, c_idx[1], c_idx[2], c_idx[2])
+                solve_christoffel!(VpVs, UpUs, solid, n, c_idx[1], c_idx[2], c_idx[3])
 
                 Pp  = n ./ VpVs[1]
                 Ps1 = n ./ VpVs[2]
