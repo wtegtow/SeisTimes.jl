@@ -49,14 +49,14 @@ struct Solid2D{V, I}
     c33::I 
     c55::I
    
-    function Solid2D(x_coords, z_coords, rho, vp, vs; eps=0.0, del=0.0)
-        μ = @. rho * vs^2
-        λ = @. rho * vp^2 - 2*μ
+    function Solid2D(x_coords, z_coords, vp, vs; eps=0.0, del=0.0)
+        μ = @. vs^2
+        λ = @. vp^2 - 2*μ
         # density normalized stiffness
-        c11 = @. ((λ + 2μ) * (2*eps .+ 1)) / rho
-        c13 = @. (λ + del * (λ + 2μ)) / rho
-        c33 = @. (λ + 2μ) / rho
-        c55 = @. (μ) / rho
+        c11 = @. ((λ + 2μ) * (2*eps .+ 1))
+        c13 = @. (λ + del * (λ + 2μ)) 
+        c33 = @. (λ + 2μ) 
+        c55 = @. (μ) 
 
         new{typeof(x_coords), typeof(c11)}(x_coords, z_coords, c11, c13, c33, c55)
     end
@@ -459,12 +459,12 @@ struct Solid3D{V, I}
     c23::I
     c12::I
    
-    function Solid3D(x_coords, y_coords, z_coords, rho, vp, vs; 
+    function Solid3D(x_coords, y_coords, z_coords, vp, vs; 
                     eps1=0., eps2=0., gam1=0., gam2=0., 
                     del1=0., del2=0., del3=0.)
 
 
-        # density normalized stiffness (excluded in c33 and c55)
+        # density normalized stiffness
         c33 = @. vp^2
         c55 = @. vs^2
         c11 = @. (2*eps2 + 1) * c33
