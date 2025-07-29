@@ -97,9 +97,8 @@ for (i, img) in enumerate(imgs)
     ax = Axis(fig[1,i], title=name[i])
     im = contourf!(ax, x_coords, z_coords, img, levels=100, colormap=:glasbey_bw_minc_20_n256)
     Colorbar(fig[2,i], im, vertical=false, height=5)
-    display(fig)
 end
-
+display(fig)
 ```
 
 ![2D Iso Traveltime](docs/assets/img1.png)
