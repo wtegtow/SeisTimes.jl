@@ -1,6 +1,6 @@
 module SeisTimes
 
-using StaticArrays, LinearAlgebra, Einsum, Interpolations
+using StaticArrays, LinearAlgebra, Einsum
 using Printf, Test
 
 export fast_sweep, Solid2D, Solid3D
