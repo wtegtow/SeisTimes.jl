@@ -1,6 +1,6 @@
 module SeisTimes
 
-using StaticArrays, LinearAlgebra, Einsum
+using StaticArrays, LinearAlgebra, Einsum, Interpolations
 using Printf, Test
 
 export fast_sweep, Solid2D, Solid3D
@@ -229,55 +229,60 @@ function compute_viscosities(solid::Solid2D; deg_increment=3, buffer_factor=2)
     return visc_p, visc_s;
 end;
 
-function inject_sources!(solid::Solid2D, T, source_mask, sources, scheme, wavemode, nx, nz, dx, dz) 
+function inject_sources!(solid::Solid2D, T, source_mask, sources_phys, scheme, wavemode) 
 
-    if scheme == :LxFS1 
+    source_center_ids = Tuple{Int, Int}[(argmin(abs.(solid.x_coords .- x)), 
+                                         argmin(abs.(solid.z_coords .- z))) 
+                                         for (x, z) in sources_phys]
+                    
+    cell_size = scheme == :LxFS1 ? 0 :
+                scheme == :LxFS3 ? 1 :
+                scheme == :LxFS5 ? 2 :
+                error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
 
-        for (sx, sz) in sources
-            T[sx, sz] = 0.
-            source_mask[sx, sz] = true
-        end
+    VpVs1 = MVector{2,Float64}(undef)
+    UpUs1 = MMatrix{2,2,Float64}(undef)
+    VpVs2 = MVector{2,Float64}(undef)
+    UpUs2 = MMatrix{2,2,Float64}(undef)
     
-    elseif scheme == :LxFS3 || scheme == :LxFS5
+    nx, nz = length(solid.x_coords), length(solid.z_coords)
+    for (is,(ix, iz)) in enumerate(source_center_ids)
+        for i in clamp(ix-cell_size, 1, nx):clamp(ix+cell_size, 1, nx)
+            for k in clamp(iz-cell_size, 1, nz):clamp(iz+cell_size, 1, nz)
 
-        cell_size = scheme == :LxFS3 ? 1 : 2
-        VpVs1 = MVector{2,Float64}(undef)
-        UpUs1 = MMatrix{2,2,Float64}(undef)
-        VpVs2 = MVector{2,Float64}(undef)
-        UpUs2 = MMatrix{2,2,Float64}(undef)
+                source_mask[i, k] = true 
 
-        for (sx, sz) in sources
-            for i in clamp(sx-cell_size, 1, nx):clamp(sx+cell_size, 1, nx)
-                for k in clamp(sz-cell_size, 1, nz):clamp(sz+cell_size, 1, nz)
+                # physical location at grid 
+                xg = solid.x_coords[i]
+                zg = solid.z_coords[k]
 
-                    source_mask[i, k] = true 
-                    if (i,k) == (sx, sz)
-                        T[i, k] = 0.
-                    else 
-                        
-                        dxi = i - sx
-                        dzi = k - sz
+                # physical location of source 
+                sx = sources_phys[is][1]
+                sz = sources_phys[is][2]
 
-                        n = SVector(dxi, dzi) / sqrt(dxi^2 +dzi^2)
-                        r = sqrt((dxi * dx)^2 + (dzi * dz)^2)
-                        solve_christoffel!(VpVs1, UpUs1, solid, n, i, k)
-                        solve_christoffel!(VpVs2, UpUs2, solid, n, sx, sz)
+                # distance
+                r = sqrt((sx - xg)^2 + (sz - zg)^2)
 
-                        # This might be not very accurate for strong heterogenities around the source
-                        if wavemode == :P 
-                            T[i,k] = r / ((VpVs1[1] + VpVs2[1])/2)
-                        elseif wavemode == :S 
-                            T[i,k] = r / ((VpVs1[2] + VpVs2[2])/2)
-                        end
-                    end
-                end 
+                # direction vector n 
+                dxi = xg - sx
+                dzi = zg - sz
+                n = SVector(dxi, dzi) / (1e-10 + sqrt(dxi^2 +dzi^2))
+
+                solve_christoffel!(VpVs1, UpUs1, solid, n, i, k)
+                solve_christoffel!(VpVs2, UpUs2, solid, n, ix, iz)
+
+                # This might be not very accurate for strong heterogenities around the source
+                if wavemode == :P 
+                    T[i,k] = r / ((1e-10 + VpVs1[1] + VpVs2[1])/2)
+                elseif wavemode == :S 
+                    T[i,k] = r / ((1e-10 + VpVs1[2] + VpVs2[2])/2)
+                end
             end
-        end
-    else
-        error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
+        end 
     end
-
 end
+
+
 
 function calc_time!(solid::Solid2D, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, k, dx, dz)
 
@@ -313,7 +318,7 @@ function calc_bcs!(T, nx, nz, N)
 end
 
 function fast_sweep(solid::Solid2D, 
-                    source_phys, 
+                    sources_phys, 
                     wavemode, 
                     scheme; 
                     verbose=false,
@@ -369,11 +374,8 @@ function fast_sweep(solid::Solid2D,
     end
 
     # inject sources
-    sources = Tuple{Int, Int}[(argmin(abs.(x_coords .- x)), 
-                               argmin(abs.(z_coords .- z))) 
-                               for (x, z) in source_phys]
     source_mask = falses(nx, nz)
-    inject_sources!(solid, T, source_mask, sources, scheme, wavemode, nx, nz, dx, dz) 
+    inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode) 
 
     # fast sweep main loop 
     inner_sweeps = (
@@ -714,62 +716,67 @@ function compute_viscosities(solid::Solid3D; deg_increment=3, buffer_factor=2)
     return visc_p, visc_s1, visc_s2
 end
 
-function inject_sources!(solid::Solid3D, T, source_mask, sources, scheme, wavemode, nx, ny, nz, dx, dy, dz) 
 
-    if scheme == :LxFS1 
+function inject_sources!(solid::Solid3D, T, source_mask, sources_phys, scheme, wavemode) 
 
-        for (sx, sy, sz) in sources
-            T[sx, sy, sz] = 0.
-            source_mask[sx, sy, sz] = true
-        end
-
-    elseif scheme == :LxFS3 || scheme == :LxFS5
-
-        cell_size = scheme == :LxFS3 ? 1 : 2
-        VpVs1 = MVector{3,Float64}(undef)
-        UpUs1 = MMatrix{3,3,Float64}(undef)
-        VpVs2 = MVector{3,Float64}(undef)
-        UpUs2 = MMatrix{3,3,Float64}(undef)
-
-        for (sx, sy, sz) in sources
-            for i in clamp(sx-cell_size, 1, nx):clamp(sx+cell_size, 1, nx)
-                for j in clamp(sy-cell_size, 1, ny):clamp(sy+cell_size, 1, ny)
-                    for k in clamp(sz-cell_size, 1, nz):clamp(sz+cell_size, 1, nz)
-
-                        source_mask[i, j, k] = true 
-
-                        if (i,k) == (sx, sz)
-                            T[i, j, k] = 0.
-                        else 
-                            
-                            dxi = i - sx
-                            dyi = j - sy
-                            dzi = k - sz
-
-                            n = SVector(dxi, dyi, dzi) / sqrt(dxi^2 +dyi^2 +dzi^2)
-                            r = sqrt((dxi * dx)^2 + (dyi * dy)^2 + (dzi * dz)^2)
+    source_center_ids = Tuple{Int, Int, Int}[(argmin(abs.(solid.x_coords .- x)), 
+                                            argmin(abs.(solid.y_coords .- y)),
+                                            argmin(abs.(solid.z_coords .- z))
+                                            ) 
+                                            for (x, y, z) in sources_phys]
                     
-                            solve_christoffel!(VpVs1, UpUs1, solid, n, i, j, k)
-                            solve_christoffel!(VpVs2, UpUs2, solid, n, sx, sy, sz)
+    cell_size = scheme == :LxFS1 ? 0 :
+                scheme == :LxFS3 ? 1 :
+                scheme == :LxFS5 ? 2 :
+                error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
 
-                            # This might be not very accurate for strong heterogenities around the source
-                            if wavemode == :P 
-                                T[i,j,k] = r / ((VpVs1[1] + VpVs2[1])/2)
-                            elseif wavemode == :S1 
-                                T[i,j,k] = r / ((VpVs1[2] + VpVs2[2])/2)
-                            elseif wavemode == :S2 
-                                T[i,j,k] = r / ((VpVs1[3] + VpVs2[3])/2)
-                            end
-                        end
-                    end 
+    VpVs1 = MVector{3,Float64}(undef)
+    UpUs1 = MMatrix{3,3,Float64}(undef)
+    VpVs2 = MVector{3,Float64}(undef)
+    UpUs2 = MMatrix{3,3,Float64}(undef)
+    
+    nx, ny, nz = length(solid.x_coords), length(solid.y_coords), length(solid.z_coords)
+    for (is,(ix, iy, iz)) in enumerate(source_center_ids)
+        for i in clamp(ix-cell_size, 1, nx):clamp(ix+cell_size, 1, nx)
+            for j in clamp(iy-cell_size, 1, ny):clamp(iy+cell_size, 1, ny)
+                for k in clamp(iz-cell_size, 1, nz):clamp(iz+cell_size, 1, nz)
+
+                    source_mask[i, j, k] = true 
+
+                    # physical location at grid 
+                    xg = solid.x_coords[i]
+                    yg = solid.y_coords[j]
+                    zg = solid.z_coords[k]
+
+                    # physical location of source 
+                    sx = sources_phys[is][1]
+                    sy = sources_phys[is][2]
+                    sz = sources_phys[is][3]
+
+                    # distance
+                    r = sqrt((sx - xg)^2 + (sy - yg)^2 + (sz - zg)^2)
+
+                    # direction vector n 
+                    dxi = xg - sx
+                    dyi = yg - sy
+                    dzi = zg - sz
+                    n = SVector(dxi, dyi, dzi) / (1e-10 + sqrt(dxi^2 + dyi^2 + dzi^2))
+
+                    solve_christoffel!(VpVs1, UpUs1, solid, n, i, j, k)
+                    solve_christoffel!(VpVs2, UpUs2, solid, n, ix, iy, iz)
+
+                    # This might be not very accurate for strong heterogenities around the source
+                    if wavemode == :P 
+                        T[i,j,k] = r / ((1e-10 + VpVs1[1] + VpVs2[1])/2)
+                    elseif wavemode == :S1 
+                        T[i,j,k] = r / ((1e-10 + VpVs1[2] + VpVs2[2])/2)
+                    elseif wavemode == :S2
+                        T[i,j,k] = r / ((1e-10 + VpVs1[3] + VpVs2[3])/2)
+                    end
                 end
             end
-        end
-    
-    else
-        error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
+        end 
     end
-
 end
 
 function calc_time!(solid::Solid3D, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, j, k, dx, dy, dz)
@@ -878,13 +885,8 @@ function fast_sweep(solid::Solid3D,
     end
 
     # inject sources
-    sources = Tuple{Int, Int, Int}[(argmin(abs.(x_coords .- x)), 
-                                    argmin(abs.(y_coords .- y)),
-                                    argmin(abs.(z_coords .- z))
-                                    ) 
-                                    for (x, y, z) in sources_phys]
     source_mask = falses(nx, ny, nz)
-    inject_sources!(solid, T, source_mask, sources, scheme, wavemode, nx, ny, nz, dx, dy, dz) 
+    inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode) 
 
     # fast sweep main loop 
     inner_sweeps = (

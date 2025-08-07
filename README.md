@@ -4,7 +4,7 @@
 [![Build Status](https://github.com/wtegtow/SeisTimes.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/wtegtow/SeisTimes.jl/actions/workflows/CI.yml?query=branch%3Amain)
 
 SeisTimes computes first-arrival traveltimes in heterogeneous 2D and 3D anisotropic media. 
-It solves the Lax-Friedrich approximation of Hamilton-Jacobi equations applied to the Eikonal equation using a Fast Sweeping numerical scheme. 
+It solves the Lax-Friedrich approximation of static Hamilton-Jacobi equations for the Eikonal equation using a Fast Sweeping numerical scheme. 
 Implemented are 1st-, 3rd-, and 5th-order Lax-Friedrichs schemes.
 
 
@@ -37,11 +37,15 @@ ort3D = Solid3D(x_coords, y_coords, z_coords, vp, vs;
 
 ```
 
-Where:
+With:
 
-eps, gam, del are 2D Thomsen anisotropy parameters
-eps1, eps2, gam1, gam2, del1, del2, del3 are 3D Tsvankin anisotropy parameters
-Once defined, the solid objects can be passed to the fast_sweep function to compute traveltimes.
+- **2D Thomsen parameters:**  
+  `eps`, `gam`, `del`
+
+- **3D Tsvankin parameters:**  
+  `eps1`, `eps2`, `gam1`, `gam2`, `del1`, `del2`, `del3`
+
+Once defined, the solid objects can be passed to the **fast_sweep** function to compute traveltimes.
 The following example shows a basic 2D use case. The 3D version works analogously.
 
 ```julia
