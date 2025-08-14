@@ -37,34 +37,19 @@ function ΦWENO(a,b,c,d)
     return ϕweno
 end
 
-function use_sources!(solid, T, source_mask, INF)
-    """ 
-    By user pre-defined initial conditions with traveltimes for source grid points, else NaN. 
-    Note: LxFS1 requires 1 point stencil
-          LxFS3 requires 2 point stencil 
-          LxFS5 requires 3 point stencil  
-    """;
-
-    @assert size(T) == size(solid.T0) ""
-    T .= solid.T0  
-    source_mask .= .!isnan.(T)
-    T[isnan.(T)] .= INF
-end
-
 # ========================================
 # 2D 
 # ========================================
 
-struct Solid2D{V, I, W}
+struct Solid2D{V, I}
     x_coords::V
     z_coords::V
     c11::I 
     c13::I 
     c33::I 
     c55::I
-    T0::W
    
-    function Solid2D(x_coords, z_coords, vp, vs; eps=0.0, del=0.0, T0=0)
+    function Solid2D(x_coords, z_coords, vp, vs; eps=0.0, del=0.0)
         μ = @. vs^2
         λ = @. vp^2 - 2*μ
         # density normalized stiffness
@@ -73,8 +58,8 @@ struct Solid2D{V, I, W}
         c33 = @. (λ + 2μ) 
         c55 = @. (μ) 
 
-        new{typeof(x_coords), typeof(c11), typeof(T0)}(
-            x_coords, z_coords, c11, c13, c33, c55, T0)
+        new{typeof(x_coords), typeof(c11)}(
+            x_coords, z_coords, c11, c13, c33, c55)
     end
 end
 
@@ -244,6 +229,15 @@ function compute_viscosities(solid::Solid2D; deg_increment=3, buffer_factor=2)
     return visc_p, visc_s;
 end;
 
+function use_sources!(T, source_mask, sources_phys, INF)
+    # source_phys = pre-computed initial traveltimes
+    # works for 2D and 3D
+    @assert size(T) == size(sources_phys) ""
+    T .= sources_phys  
+    source_mask .= .!isnan.(T)
+    T[isnan.(T)] .= INF
+end
+
 function inject_sources!(solid::Solid2D, T, source_mask, sources_phys, scheme, wavemode) 
 
     source_center_ids = Tuple{Int, Int}[(argmin(abs.(solid.x_coords .- x)), 
@@ -386,10 +380,10 @@ function fast_sweep(solid::Solid2D,
     T     = fill(INF, nx, nz)
     T_old = fill(INF, nx, nz)
     source_mask = falses(nx, nz)
-    if solid.T0 == 0
+    if size(sources_phys) == (nx, nz)
+        use_sources!(T, source_mask, sources_phys, INF)
+    else
         inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode)
-    elseif size(solid.T0) == (nx, nz)
-        use_sources!(solid, T, source_mask, INF)
     end
 
     # fast sweep 
@@ -464,7 +458,7 @@ end
 # 3D
 # ========================================
 
-struct Solid3D{V, I, W}
+struct Solid3D{V, I}
     x_coords::V
     y_coords::V
     z_coords::V
@@ -477,12 +471,10 @@ struct Solid3D{V, I, W}
     c13::I
     c23::I
     c12::I
-    T0::W
    
     function Solid3D(x_coords, y_coords, z_coords, vp, vs; 
                     eps1=0., eps2=0., gam1=0., gam2=0., 
-                    del1=0., del2=0., del3=0., T0=0)
-
+                    del1=0., del2=0., del3=0.)
 
         # density normalized stiffness
         c33 = @. vp^2
@@ -495,12 +487,11 @@ struct Solid3D{V, I, W}
         c23 = @. sqrt(2 * c33 * (c33 - c44) * del1 + (c33 - c44)^2) - c44
         c12 = @. sqrt(2 * c11 * (c11 - c66) * del3 + (c11 - c66)^2) - c66
 
-        new{typeof(x_coords), typeof(c11), typeof(T0)}(
+        new{typeof(x_coords), typeof(c11)}(
             x_coords, y_coords, z_coords,
-            c33, c55, c11, c22, c66, c44, c13, c23, c12, T0)
+            c33, c55, c11, c22, c66, c44, c13, c23, c12)
     end
 end
-
 
 function Γn(solid::Solid3D, n, i::Int, j::Int, k::Int)
 
@@ -533,7 +524,6 @@ function solve_christoffel!(VpVs::MVector{3,Float64}, UpUs::MMatrix{3,3,Float64}
     UpUs[:,2] .= U[:,2]       
     UpUs[:,3] .= U[:,1]   
 end
-
 
 function LxFS1(T, i, j, k, dx, dy, dz)
     return SVector(T[i+1,j,k], T[i-1,j,k],  
@@ -901,10 +891,11 @@ function fast_sweep(solid::Solid3D,
     T     = fill(INF, nx, ny, nz)
     T_old = fill(INF, nx, ny, nz)
     source_mask = falses(nx, ny, nz)
-    if solid.T0 == 0
+
+    if size(sources_phys) == (nx, ny, nz)
+        use_sources!(T, source_mask, sources_phys, INF)
+    else 
         inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode)
-    elseif size(solid.T0) == (nx, ny, nz)
-        use_sources!(solid, T, source_mask, INF)
     end
 
     # fast sweep 
