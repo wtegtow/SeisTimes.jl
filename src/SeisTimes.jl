@@ -37,19 +37,34 @@ function ΦWENO(a,b,c,d)
     return ϕweno
 end
 
+function use_sources!(solid, T, source_mask, INF)
+    """ 
+    By user pre-defined initial conditions with traveltimes for source grid points, else NaN. 
+    Note: LxFS1 requires 1 point stencil
+          LxFS3 requires 2 point stencil 
+          LxFS5 requires 3 point stencil  
+    """;
+
+    @assert size(T) == size(solid.T0) ""
+    T .= solid.T0  
+    source_mask .= .!isnan.(T)
+    T[isnan.(T)] .= INF
+end
+
 # ========================================
 # 2D 
 # ========================================
 
-struct Solid2D{V, I}
+struct Solid2D{V, I, W}
     x_coords::V
     z_coords::V
     c11::I 
     c13::I 
     c33::I 
     c55::I
+    T0::W
    
-    function Solid2D(x_coords, z_coords, vp, vs; eps=0.0, del=0.0)
+    function Solid2D(x_coords, z_coords, vp, vs; eps=0.0, del=0.0, T0=0)
         μ = @. vs^2
         λ = @. vp^2 - 2*μ
         # density normalized stiffness
@@ -58,7 +73,8 @@ struct Solid2D{V, I}
         c33 = @. (λ + 2μ) 
         c55 = @. (μ) 
 
-        new{typeof(x_coords), typeof(c11)}(x_coords, z_coords, c11, c13, c33, c55)
+        new{typeof(x_coords), typeof(c11), typeof(T0)}(
+            x_coords, z_coords, c11, c13, c33, c55, T0)
     end
 end
 
@@ -82,7 +98,6 @@ function solve_christoffel!(VpVs::MVector{2,Float64}, UpUs::MMatrix{2,2,Float64}
     UpUs[:,1] .= U[:,2]         
     UpUs[:,2] .= U[:,1]         
 end
-
 
 function LxFS1(T, i, k, dx, dz)
     return SVector(T[i+1,k], T[i-1,k],  T[i,k+1],  T[i,k-1])
@@ -283,7 +298,6 @@ function inject_sources!(solid::Solid2D, T, source_mask, sources_phys, scheme, w
 end
 
 
-
 function calc_time!(solid::Solid2D, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, k, dx, dz)
 
     tp_x, tm_x, tp_z, tm_z = lxfs(T, i, k, dx, dz)
@@ -329,7 +343,6 @@ function fast_sweep(solid::Solid2D,
     # params 
     INF = 1e10 # initial value
 
-    # allocations
     x_coords = solid.x_coords
     dx = x_coords[2] - x_coords[1]
     nx = length(x_coords)
@@ -337,10 +350,6 @@ function fast_sweep(solid::Solid2D,
     z_coords = solid.z_coords
     dz = z_coords[2] - z_coords[1]
     nz = length(z_coords)
-
-    T     = fill(INF, nx, nz)
-    T_old = fill(INF, nx, nz)
-    E = similar(T)
 
     VpVs = MVector{2,Float64}(undef)
     UpUs = MMatrix{2,2,Float64}(undef)
@@ -373,11 +382,17 @@ function fast_sweep(solid::Solid2D,
         error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
     end
 
-    # inject sources
+    # sources
+    T     = fill(INF, nx, nz)
+    T_old = fill(INF, nx, nz)
     source_mask = falses(nx, nz)
-    inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode) 
+    if solid.T0 == 0
+        inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode)
+    elseif size(solid.T0) == (nx, nz)
+        use_sources!(solid, T, source_mask, INF)
+    end
 
-    # fast sweep main loop 
+    # fast sweep 
     inner_sweeps = (
         (1+N:1:nx-N , 1+N:1:nz-N), 
         (nx-N:-1:1+N, 1+N:1:nz-N), 
@@ -389,6 +404,7 @@ function fast_sweep(solid::Solid2D,
     diverged  = false
     L2_error = INF
     L∞_error = INF
+    E = similar(T)
 
     if verbose 
         println("===============================================")
@@ -417,6 +433,7 @@ function fast_sweep(solid::Solid2D,
 
         L2_error = L2!(E, T, T_old)
         L∞_error = L∞!(E, T, T_old)
+
         # check convergence
         if L∞_error  < max_error_tol
             if verbose println("Solution converged after $(iter) iterations.") end 
@@ -447,7 +464,7 @@ end
 # 3D
 # ========================================
 
-struct Solid3D{V, I}
+struct Solid3D{V, I, W}
     x_coords::V
     y_coords::V
     z_coords::V
@@ -460,10 +477,11 @@ struct Solid3D{V, I}
     c13::I
     c23::I
     c12::I
+    T0::W
    
     function Solid3D(x_coords, y_coords, z_coords, vp, vs; 
                     eps1=0., eps2=0., gam1=0., gam2=0., 
-                    del1=0., del2=0., del3=0.)
+                    del1=0., del2=0., del3=0., T0=0)
 
 
         # density normalized stiffness
@@ -477,9 +495,9 @@ struct Solid3D{V, I}
         c23 = @. sqrt(2 * c33 * (c33 - c44) * del1 + (c33 - c44)^2) - c44
         c12 = @. sqrt(2 * c11 * (c11 - c66) * del3 + (c11 - c66)^2) - c66
 
-        new{typeof(x_coords), typeof(c11)}(
+        new{typeof(x_coords), typeof(c11), typeof(T0)}(
             x_coords, y_coords, z_coords,
-            c33, c55, c11, c22, c66, c44, c13, c23, c12)
+            c33, c55, c11, c22, c66, c44, c13, c23, c12, T0)
     end
 end
 
@@ -648,7 +666,7 @@ end
 
 function compute_viscosities(solid::Solid3D; deg_increment=3, buffer_factor=2)
 
-    # assembling C for every grid point might be too expensive?
+    # assembling C for every grid point
     C = ([ (solid.c11[i,j,k], solid.c12[i,j,k], solid.c13[i,j,k],
                               solid.c22[i,j,k], solid.c23[i,j,k],
             solid.c44[i,j,k], solid.c55[i,j,k], solid.c66[i,j,k]) 
@@ -742,7 +760,7 @@ function inject_sources!(solid::Solid3D, T, source_mask, sources_phys, scheme, w
                 for k in clamp(iz-cell_size, 1, nz):clamp(iz+cell_size, 1, nz)
 
                     source_mask[i, j, k] = true 
-
+                    
                     # physical location at grid 
                     xg = solid.x_coords[i]
                     yg = solid.y_coords[j]
@@ -789,6 +807,7 @@ function calc_time!(solid::Solid3D, T, VpVs, UpUs, lxfs, viscosities, velocity_i
     p_norm = sqrt(p[1]^2 + p[2]^2 + p[3]^2)
     if p_norm == 0 return end 
     p = p / p_norm
+
     solve_christoffel!(VpVs, UpUs, solid, p, i, j, k)
 
     H = 1/VpVs[velocity_index] - p_norm 
@@ -796,9 +815,9 @@ function calc_time!(solid::Solid3D, T, VpVs, UpUs, lxfs, viscosities, velocity_i
     C = viscosities[1] * ((tp_x + tm_x)/(2*dx)) + 
         viscosities[2] * ((tp_y + tm_y)/(2*dy)) + 
         viscosities[3] * ((tp_z + tm_z)/(2*dz))
+
     T_new = A * (H + C)
     T[i,j,k] = min(T_new, T[i,j,k])
-
 end
 
 function calc_bcs!(T, nx, ny, nz, N)
@@ -820,7 +839,6 @@ function calc_bcs!(T, nx, ny, nz, N)
     end
 end
 
-
 function fast_sweep(solid::Solid3D, 
                     sources_phys, 
                     wavemode, 
@@ -833,7 +851,6 @@ function fast_sweep(solid::Solid3D,
     # params 
     INF = 1e10 # initial value
 
-    # allocations
     x_coords = solid.x_coords
     dx = x_coords[2] - x_coords[1]
     nx = length(x_coords)
@@ -845,10 +862,6 @@ function fast_sweep(solid::Solid3D,
     z_coords = solid.z_coords
     dz = z_coords[2] - z_coords[1]
     nz = length(z_coords)
-
-    T     = fill(INF, nx, ny, nz)
-    T_old = fill(INF, nx, ny, nz)
-    E =     fill(INF, nx, ny, nz)
 
     VpVs = MVector{3,Float64}(undef)
     UpUs = MMatrix{3,3,Float64}(undef)
@@ -884,11 +897,17 @@ function fast_sweep(solid::Solid3D,
         error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
     end
 
-    # inject sources
+    # sources
+    T     = fill(INF, nx, ny, nz)
+    T_old = fill(INF, nx, ny, nz)
     source_mask = falses(nx, ny, nz)
-    inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode) 
+    if solid.T0 == 0
+        inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode)
+    elseif size(solid.T0) == (nx, ny, nz)
+        use_sources!(solid, T, source_mask, INF)
+    end
 
-    # fast sweep main loop 
+    # fast sweep 
     inner_sweeps = (
         (1+N:1:nx-N,  1+N:1:ny-N,  1+N:1:nz-N),    
         (1+N:1:nx-N,  1+N:1:ny-N,  nz-N:-1:1+N),   
@@ -904,6 +923,7 @@ function fast_sweep(solid::Solid3D,
     diverged  = false
     L2_error = INF
     L∞_error = INF
+    E = fill(INF, nx, ny, nz)
 
     if verbose 
         println("===============================================")
@@ -932,6 +952,7 @@ function fast_sweep(solid::Solid3D,
 
         L2_error = L2!(E, T, T_old)
         L∞_error = L∞!(E, T, T_old)
+        
         # check convergence
         if L∞_error  < max_error_tol
             if verbose println("Solution converged after $(iter) iterations.") end 
@@ -957,6 +978,5 @@ function fast_sweep(solid::Solid3D,
     return T
 
 end
-
 
 end
