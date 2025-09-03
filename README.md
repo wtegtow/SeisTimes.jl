@@ -19,7 +19,7 @@ using Pkg
 Pkg.add(url="https://github.com/wtegtow/SeisTimes.jl")
 ```
 
-# Quick Start - Wavefield Construction (LxFS)
+# Quick Start - Wavefront Construction (LxFS)
 
 Wavefront exports 3 functionalities:
 - Solid2D 
@@ -133,7 +133,7 @@ The **ray_bending** function expects the following inputs:
 
 Once defined, these objects can be passed to the **ray_bending** function to compute traveltimes.
 
-**Note**: This ray tracing works only for horizontally layered media.
+**Note**: This ray tracing works only for horizontally layered media. 
 
 For reference, the following 2D example computes the same travel time grids shown above.
 
