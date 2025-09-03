@@ -3,9 +3,14 @@
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://wtegtow.github.io/SeisTimes.jl/dev/)
 [![Build Status](https://github.com/wtegtow/SeisTimes.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/wtegtow/SeisTimes.jl/actions/workflows/CI.yml?query=branch%3Amain)
 
-SeisTimes computes first-arrival traveltimes in heterogeneous 2D and 3D anisotropic media. 
-It solves the Lax-Friedrich approximation of static Hamilton-Jacobi equations for the Eikonal equation using a Fast Sweeping numerical scheme. 
-Implemented are 1st-, 3rd-, and 5th-order Lax-Friedrichs schemes.
+
+SeisTimes is a toolkit for computing first-arrival seismic traveltimes in heterogeneous 2D and 3D anisotropic media.
+
+Implemented are:
+- Ray tracing using the bending method for horizontally layered media.
+- Wavefield construction via the Lax-Friedrichs approximation of the static Hamilton-Jacobi (Eikonal) equations for weakly anisotropic media.
+  - Supports Fast Sweeping numerical schemes for general heterogeneous media on regular grids.
+  - Includes 1st-, 3rd-, and 5th-order Lax-Friedrichs schemes for flexible accuracy.
 
 
 # Installation
@@ -14,9 +19,9 @@ using Pkg
 Pkg.add(url="https://github.com/wtegtow/SeisTimes.jl")
 ```
 
-# Quick Start 
+# Quick Start - Wavefield Construction (LxFS)
 
-The application exports 3 functionalities:
+Wavefront exports 3 functionalities:
 - Solid2D 
 - Solid3D
 - fast sweep
@@ -55,7 +60,7 @@ using GLMakie
 Makie.inline!(true)
 
 # 2d example
-h = 10 
+h = 5
 x_coords = 0:h:500 
 z_coords = 0:h:500 
 
@@ -65,7 +70,8 @@ eps = zeros(length(x_coords), length(z_coords)) .+ 0.25
 del = zeros(length(x_coords), length(z_coords)) .- 0.1
 
 # add some heterogeneity 
-vp[:, 18:34] .= 1800.0  
+vp[:, 18:34] .= 2200.0  
+vs[:, 18:34] .= 750.0 
 
 # source location
 source = [(100, 400)]
@@ -75,7 +81,7 @@ iso = Solid2D(x_coords, z_coords, vp, vs)
 vti = Solid2D(x_coords, z_coords, vp, vs; eps=eps, del=del)
 
 # algorithm parameter 
-wavemode = :P # :P, :S 
+wavemode = :S # :P, :S 
 scheme = :LxFS5 # LxFS1 -> 1st order, LxFS3 -> 3rd order, LxFS5 -> 5th order Lax-Friedrich schemes 
 verbose = false  
 max_iter=200
@@ -94,21 +100,101 @@ tt_vti = fast_sweep(vti, source, wavemode, scheme;
                     viscosity_buffer=viscosity_buffer)
 
 # visualize
-name = ["isotrop", "anisotrop"]
+name = ["S", "qS"]
 imgs = [tt_iso, tt_vti]
-fig = Figure(size=(700,350)) 
+fig = Figure(size=(700,400)) 
 for (i, img) in enumerate(imgs)
     ax = Axis(fig[1,i], title=name[i])
     im = contourf!(ax, x_coords, z_coords, img, levels=100, colormap=:glasbey_bw_minc_20_n256)
-    Colorbar(fig[2,i], im, vertical=false, height=5)
+    Colorbar(fig[2,i], im, vertical=false, height=5, label="sec")
 end
+save("docs/assets/img1.png", fig; px_per_unit=2)
 display(fig)
+
 ```
 
 ![2D Iso Traveltime](docs/assets/img1.png)
 
 
-See the examples/ folder for more comprehensive use cases.
+# Quick Start - 2-Point Ray Tracing 
+
+Wavefront exports 1 functionality:
+- **ray_bending** 
+
+The **ray_bending** function expects the following inputs:
+
+- Matrix with layer properties:
+
+  - For 2D: a [nlayer × 4] matrix with columns representing vp, vs, epsilon, and delta.
+
+  - For 3D: a [nlayer × 9] matrix with columns representing vp, vs, epsilon1, epsilon2, gamma1, gamma2, delta1, delta2, and delta3.
+
+- Depths of layer interfaces
+
+Once defined, these objects can be passed to the **ray_bending** function to compute traveltimes.
+
+**Note**: This ray tracing works only for horizontally layered media.
+
+For reference, the following 2D example computes the same travel time grids shown above.
+
+```julia
+
+using SeisTimes
+using GLMakie
+Makie.inline!(true)
+
+# 2d example
+h = 5
+x_coords = 0:h:500 
+z_coords = 0:h:500 
+nx, nz = length(x_coords), length(z_coords)
+
+# specify layer properties
+vp_layers = [2000, 2200, 2000]
+vs_layers = [1000, 750, 1000]
+eps_layers = [0.25, 0.25, 0.25]
+del_layers = [-0.1, -0.1, -0.1]
+# assemble in [nlayer x 4] matrix
+Miso = hcat(vp_layers, vs_layers, zeros(3), zeros(3))
+Mvti = hcat(vp_layers, vs_layers, eps_layers, del_layers)
+
+# specify interface depths 
+interface_depths = [z_coords[18], z_coords[34]]
+
+wavemode = :S # :P, :S 
+source = (100, 400)
+
+# compute travel times with 2-point ray tracing 
+tt_iso = zeros(nx,nz)
+tt_vti = zeros(nx,nz)
+
+for x in 1:nx, z in 1:nz 
+    rcv = (x_coords[x], z_coords[z])
+    if src != rcv
+        tt_iso[x,z] = ray_bending(wavemode, Miso, interface_depths, src, rcv; verbose=false).t 
+        tt_vti[x,z] = ray_bending(wavemode, Mvti, interface_depths, src, rcv; verbose=false).t
+    end 
+end 
+
+# visualize
+name = ["S", "qS"]
+imgs = [tt_iso, tt_vti]
+fig = Figure(size=(700,400)) 
+for (i, img) in enumerate(imgs)
+    ax = Axis(fig[1,i], title=name[i])
+    im = contourf!(ax, x_coords, z_coords, img, levels=100, colormap=:glasbey_bw_minc_20_n256)
+    Colorbar(fig[2,i], im, vertical=false, height=5, label="sec")
+end
+display(fig)
+
+```
+
+![2D Iso Traveltime](docs/assets/img2.png)
+
+As shown, the Lax-Friedrichs (LxFS) method selects the slowest branch of the multivalued qS wavefront, rather than the faster cuspidal branches. In contrast, ray tracing is able to capture the singularities of the S-wave.
+
+The 3D variants work analogously.
+See the examples/ folder for more complex use cases.
 
 # References
 
