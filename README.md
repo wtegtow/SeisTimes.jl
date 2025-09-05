@@ -7,7 +7,7 @@
 SeisTimes is a toolkit for computing first-arrival seismic traveltimes in heterogeneous 2D and 3D anisotropic media.
 
 Implemented are:
-- Wavefield construction using the Lax-Friedrichs approximation of the static Hamilton-Jacobi (Eikonal) equation for weakly anisotropic media.
+- Wavefront construction using the Lax-Friedrichs approximation of the static Hamilton-Jacobi (Eikonal) equation for weakly anisotropic media.
   - Fast Sweeping numerical scheme for general heterogeneous media on regular grids.
   - Includes 1st-, 3rd-, and 5th-order Lax-Friedrichs schemes for flexible accuracy.
 - 2-Point ray tracing using the bending method for horizontally layered media.
