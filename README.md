@@ -118,7 +118,7 @@ display(fig)
 
 # Quick Start - 2-Point Ray Tracing 
 
-Bending exports 1 functionality:
+tracer exports 1 functionality:
 - **ray_bending** 
 
 which expects the following inputs:
