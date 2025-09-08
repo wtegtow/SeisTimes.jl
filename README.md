@@ -17,7 +17,7 @@ using Pkg
 Pkg.add(url="https://github.com/wtegtow/SeisTimes.jl")
 ```
 
-# Quick Start - Wavefront Construction (LxFS)
+# Quick Start 
 
 Wavefront exports 3 functionalities:
 - Solid2D 
