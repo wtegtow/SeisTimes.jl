@@ -9,7 +9,7 @@ SeisTimes can be used to compute first-arrival seismic traveltimes in heterogene
 # Method
 - Wavefront construction using the Lax-Friedrichs approximation of the static Hamilton-Jacobi (Eikonal) equation for weakly anisotropic media.
   - Fast Sweeping numerical scheme for general heterogeneous media on regular grids.
-  - Includes 1st-, 3rd-, and 5th-order Lax-Friedrichs schemes for flexible accuracy.
+  - 1st-, 3rd-, and 5th-order Lax-Friedrichs schemes for flexible accuracy.
 
 # Installation
 ``` julia 
@@ -19,7 +19,7 @@ Pkg.add(url="https://github.com/wtegtow/SeisTimes.jl")
 
 # Quick Start 
 
-Wavefront exports 3 functionalities:
+SeisTimes exports 3 functionalities:
 - Solid2D 
 - Solid3D
 - fast sweep
