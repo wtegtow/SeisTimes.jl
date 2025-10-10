@@ -441,7 +441,7 @@ function fast_sweep(solid::Solid2D,
         end
 
         # check divergence 
-        if any(T .< 0) || any(T .> INF*2) 
+        if any(T .< 0) || any(T .> INF*10) 
             println("Solution diverged. Try larger viscosity_buffer than $(viscosity_buffer).")
             diverged = true
             break
@@ -964,7 +964,7 @@ function fast_sweep(solid::Solid3D,
         end
 
         # check divergence 
-        if any(T .< 0) || any(T .> INF*2) 
+        if any(T .< 0) || any(T .> INF*10) 
             println("Solution diverged. Try larger viscosity_buffer than $(viscosity_buffer).")
             diverged = true
             break
