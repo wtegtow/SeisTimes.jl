@@ -435,7 +435,7 @@ function fast_sweep(solid::Solid2D,
 
         # check convergence
         if L∞_error  < max_error_tol
-            if verbose println("Solution converged after $(iter) iterations.") end 
+            println("Solution converged after $(iter) iterations.")
             converged = true
             break
         end
@@ -455,7 +455,7 @@ function fast_sweep(solid::Solid2D,
         println("Solution not converged. Try larger max_iter than $(max_iter).")
     end
 
-    return T
+    return (T=T, converged=converged)
 
 end
 
@@ -958,14 +958,14 @@ function fast_sweep(solid::Solid3D,
         
         # check convergence
         if L∞_error  < max_error_tol
-            if verbose println("Solution converged after $(iter) iterations.") end 
+            println("$(wavemode) Solution converged after $(iter) iterations.") 
             converged = true
             break
         end
 
         # check divergence 
-        if any(T .< 0) || any(T .> INF*10) 
-            println("Solution diverged. Try larger viscosity_buffer than $(viscosity_buffer).")
+        if any(T .< 0) || any(T .> INF*1e3)
+            println("$(wavemode) Solution diverged. Try larger viscosity_buffer than $(viscosity_buffer).")
             diverged = true
             break
         end
@@ -975,9 +975,9 @@ function fast_sweep(solid::Solid3D,
     end
 
     if !converged && !diverged
-        println("Solution not converged. Try larger max_iter than $(max_iter).")
+        println("$(wavemode) Solution not converged. Try larger max_iter than $(max_iter).")
     end
 
-    return T
+    return (T=T, converged=converged)
 
 end

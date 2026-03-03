@@ -24,7 +24,7 @@ SeisTimes exports 3 functionalities:
 - Solid3D
 - fast sweep
 
-The solid object constructors take x,z or x,y,z coordinates and nx,nz or nx,ny,nz arrays of P-wave and S-wave velocities for 2D and 3D problems, respectivly. 
+The solid object constructors take (x,z) or (x,y,z) 1D coordinate arrays, and (nx,nz) or (nx,ny,nz) 3D arrays of P-wave and S-wave velocities for 2D and 3D problems, respectivly. 
 
 Optional keyword arguments can be used to define anisotropic media:
 
@@ -42,14 +42,15 @@ ort3D = Solid3D(x_coords, y_coords, z_coords, vp, vs;
 
 With:
 
-- **2D Thomsen parameters:**  
+- **(nx,nz) Thomsen parameters:**  
   `eps`, `gam`, `del`
 
-- **3D Tsvankin parameters:**  
+- **(nx,ny,nz) Tsvankin parameters:**  
   `eps1`, `eps2`, `gam1`, `gam2`, `del1`, `del2`, `del3`
 
 Once defined, the solid objects can be passed to the **fast_sweep** function to compute traveltimes.
-The following example shows a basic 2D use case. The 3D version works analogously.
+**fast_sweep** returns a named tuple `(T=T, converged=converged)`, where `T` is the traveltime grid array and `converged` is a boolean flag indicating whether the solution converged within the specified tolerance. 
+The following example demonstrate basic 2D usage:
 
 ```julia
 
@@ -91,15 +92,18 @@ tt_iso = fast_sweep(iso, source, wavemode, scheme;
                     max_iter=max_iter, 
                     max_error_tol=max_error_tol,
                     viscosity_buffer=viscosity_buffer)
+@assert tt_iso.converged == true
+
 
 tt_vti = fast_sweep(vti, source, wavemode, scheme;
                     max_iter=max_iter, 
                     max_error_tol=max_error_tol,
                     viscosity_buffer=viscosity_buffer)
+@assert tt_vti.converged == true
 
 # visualize
 name = ["S", "qS"]
-imgs = [tt_iso, tt_vti]
+imgs = [tt_iso.T, tt_vti.T] # .T for travel time arrays
 fig = Figure(size=(700,400)) 
 for (i, img) in enumerate(imgs)
     ax = Axis(fig[1,i], title=name[i])
