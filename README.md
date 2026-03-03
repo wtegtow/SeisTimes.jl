@@ -24,7 +24,9 @@ SeisTimes exports 3 functionalities:
 - Solid3D
 - fast sweep
 
-The solid object constructors take (x,z) or (x,y,z) 1D coordinate arrays, and (nx,nz) or (nx,ny,nz) 3D arrays of P-wave and S-wave velocities for 2D and 3D problems, respectivly. 
+The solid object constructors require:
+- **1D coordinate arrays**: `x_coordinates`, `z_coords` (for 2D) or `x_coords`, `y_coords`, `z_coords` (for 3D)
+- **Regular velocity grids**: 2D arrays `vp`, `vs` (for 2D problems) or 3D arrays `vp`, `vs` (for 3D problems)
 
 Optional keyword arguments can be used to define anisotropic media:
 
@@ -42,10 +44,10 @@ ort3D = Solid3D(x_coords, y_coords, z_coords, vp, vs;
 
 With:
 
-- **(nx,nz) Thomsen parameters:**  
+- **2D Thomsen parameters:**  
   `eps`, `gam`, `del`
 
-- **(nx,ny,nz) Tsvankin parameters:**  
+- **3D Tsvankin parameters:**  
   `eps1`, `eps2`, `gam1`, `gam2`, `del1`, `del2`, `del3`
 
 Once defined, the solid objects can be passed to the **fast_sweep** function to compute traveltimes.
