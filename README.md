@@ -26,7 +26,7 @@ SeisTimes exports 3 functionalities:
 
 The solid object constructors require:
 - **1D coordinate arrays**: `x_coords`, `z_coords` (for 2D) or `x_coords`, `y_coords`, `z_coords` (for 3D)
-- **Regular velocity grids**: 2D arrays `vp`, `vs` (for 2D problems) or 3D arrays `vp`, `vs` (for 3D problems)
+- **Regular velocity grids**: 2D`(nx,nz)` arrays `vp`, `vs` (for 2D problems) or 3D `(nx,ny,nz)` arrays `vp`, `vs` (for 3D problems)
 
 Optional keyword arguments can be used to define anisotropic media:
 
