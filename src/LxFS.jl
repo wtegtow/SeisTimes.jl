@@ -89,8 +89,8 @@ function group_velocity(VpVs::MVector{2,Float64}, UpUs::MMatrix{2,2,Float64}, so
     ΓUs = Γn(solid, UpUs[:,2], i, k)
     @einsum gp[i] := ΓUp[i,j] * Pp[j]
     @einsum gs[i] := ΓUs[i,j] * Ps[j]
-    @test dot(gp,Pp) ≈ 1 rtol=1e-3
-    @test dot(gs,Ps) ≈ 1 rtol=1e-3
+    @assert dot(gp,Pp) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for P wave"
+    @assert dot(gs,Ps) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for S wave"
     return (gp, gs)
 end
 
@@ -230,13 +230,72 @@ end;
 
 function use_sources!(T, source_mask, sources_phys, INF)
     # source_phys = pre-computed initial traveltimes
+    # stencil sizes must be considered before.
     # works for 2D and 3D
+    # values elsewhere must be NaN
     @assert size(T) == size(sources_phys) ""
     T .= sources_phys  
     source_mask .= .!isnan.(T)
     T[isnan.(T)] .= INF
 end
 
+function traveltime_along_straight_ray(solid::Solid2D, sx, sz, xg, zg, wavemode; n_segments=10)
+    """
+    Compute traveltime along straight ray from source (sx, sz) to grid point (xg, zg).
+    Note: This is an approximation of the true traveltime, but it is used as initial condition for the fast sweeping method. 
+    Exact traveltime injection will be implemented in the future.
+    """
+    
+    r = sqrt((xg - sx)^2 + (zg - sz)^2)
+    if r == 0.0
+        return 0.0
+    end
+
+    # ray direction 
+    n = SVector((xg - sx) / r, (zg - sz) / r)
+
+    # segment length
+    ds = r / n_segments
+
+    VpVs = MVector{2,Float64}(undef)
+    UpUs = MMatrix{2,2,Float64}(undef)
+
+    nx = length(solid.x_coords)
+    nz = length(solid.z_coords)
+    dx = solid.x_coords[2] - solid.x_coords[1]
+    dz = solid.z_coords[2] - solid.z_coords[1]
+    x0 = solid.x_coords[1]
+    z0 = solid.z_coords[1]
+
+    t_total = 0.0
+
+    for seg in 1:n_segments
+        # midpoint of segment
+        frac = (seg - 0.5) / n_segments
+        xm = sx + frac * (xg - sx)
+        zm = sz + frac * (zg - sz)
+
+        # find nearest grid indices for midpoint 
+        im = clamp(round(Int, (xm - x0) / dx) + 1, 1, nx)
+        km = clamp(round(Int, (zm - z0) / dz) + 1, 1, nz)
+
+        # group velocity at midpoint in ray direction
+        gp, gs = group_velocity(VpVs, UpUs, solid, n, im, km)
+
+        if wavemode == :P
+            v_group = norm(gp)
+        elseif wavemode == :S
+            v_group = norm(gs)
+        else
+            error("wavemode $(wavemode) not in [:P, :S]")
+        end
+
+        # accumulate traveltime
+        t_total += ds / (v_group + 1e-15)
+    end
+
+    return t_total
+end
 
 function inject_sources!(solid::Solid2D, T, source_mask, sources_phys, scheme, wavemode) 
 
@@ -267,29 +326,9 @@ function inject_sources!(solid::Solid2D, T, source_mask, sources_phys, scheme, w
                 sx = sources_phys[is][1]
                 sz = sources_phys[is][2]
 
-                # distance
-                r = sqrt((sx - xg)^2 + (sz - zg)^2)
-                if r == 0
-                    T[i,k] = 0
-                    continue 
-                end
-
-                # unit normals src -> point
-                dxi = xg - sx
-                dzi = zg - sz
-                n = SVector(dxi, dzi) / (1e-15 + sqrt(dxi^2 +dzi^2))
-                
-                # group velocities
-                gp_pkt, gs_pkt = group_velocity(VpVs, UpUs, solid, n, i, k)
-                gp_src, gs_src = group_velocity(VpVs, UpUs, solid, n, ix, iz)
-
-                # This might be not very accurate for strong heterogenities around the source
-                # Would be more better to integrate the full path src -> point
-                if wavemode == :P 
-                    T[i,k] = r / ((1e-15 + norm(gp_pkt) + norm(gp_src))/2)
-                elseif wavemode == :S 
-                    T[i,k] = r / ((1e-15 + norm(gs_pkt) + norm(gs_src))/2)
-                end
+                # traveltime 
+                t_ray = traveltime_along_straight_ray(solid, sx, sz, xg, zg, wavemode; n_segments=10) # yet not very accurate if source region is heterogenious.
+                T[i,k] = t_ray
                 
             end
         end 
@@ -545,9 +584,9 @@ function group_velocity(VpVs::MVector{3,Float64}, UpUs::MMatrix{3,3,Float64}, so
     @einsum  gp[i] := ΓUp[i,j] * Pp[j]
     @einsum gs1[i] := ΓUs1[i,j] * Ps1[j]
     @einsum gs2[i] := ΓUs2[i,j] * Ps2[j]
-    @test dot(gp,Pp) ≈ 1 rtol=1e-3
-    @test dot(gs1,Ps1) ≈ 1 rtol=1e-3
-    @test dot(gs2,Ps2) ≈ 1 rtol=1e-3
+    @assert dot(gp,Pp) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for P wave"
+    @assert dot(gs1,Ps1) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for S1 wave"
+    @assert dot(gs2,Ps2) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for S2 wave"
     return (gp, gs1, gs2)
 end
 
@@ -734,6 +773,70 @@ function compute_viscosities(solid::Solid3D; deg_increment=3, buffer_factor=2)
     return visc_p, visc_s1, visc_s2
 end
 
+function traveltime_along_straight_ray(solid::Solid3D, sx, sy, sz, xg, yg, zg, wavemode; n_segments=10)
+    """
+    Compute traveltime along straight ray from source (sx, sy, sz) to grid point (xg, yg, zg).
+    Note: This is an approximation of the true traveltime, but it is used as initial condition for the fast sweeping method. 
+    Exact traveltime injection will be implemented in the future.
+    """
+    
+    r = sqrt((xg - sx)^2 + (yg - sy)^2 + (zg - sz)^2)
+    if r == 0.0
+        return 0.0
+    end
+
+    # ray direction 
+    n = SVector((xg - sx) / r, (yg - sy) / r, (zg - sz) / r)
+
+    # segment length
+    ds = r / n_segments
+
+    VpVs = MVector{3,Float64}(undef)
+    UpUs = MMatrix{3,3,Float64}(undef)
+
+    nx = length(solid.x_coords)
+    ny = length(solid.y_coords)
+    nz = length(solid.z_coords)
+    dx = solid.x_coords[2] - solid.x_coords[1]
+    dy = solid.y_coords[2] - solid.y_coords[1]
+    dz = solid.z_coords[2] - solid.z_coords[1]
+    x0 = solid.x_coords[1]
+    y0 = solid.y_coords[1]
+    z0 = solid.z_coords[1]
+
+    t_total = 0.0
+
+    for seg in 1:n_segments
+        # midpoint of segment
+        frac = (seg - 0.5) / n_segments
+        xm = sx + frac * (xg - sx)
+        ym = sy + frac * (yg - sy)
+        zm = sz + frac * (zg - sz)
+
+        # find nearest grid indices for midpoint 
+        im = clamp(round(Int, (xm - x0) / dx) + 1, 1, nx)
+        jm = clamp(round(Int, (ym - y0) / dy) + 1, 1, ny)
+        km = clamp(round(Int, (zm - z0) / dz) + 1, 1, nz)
+
+        # group velocity at midpoint in ray direction
+        gp, gs1, gs2 = group_velocity(VpVs, UpUs, solid, n, im, jm, km)
+
+        if wavemode == :P
+            v_group = norm(gp)
+        elseif wavemode == :S1
+            v_group = norm(gs1)
+        elseif wavemode == :S2
+            v_group = norm(gs2)
+        else
+            error("wavemode $(wavemode) not in [:P, :S1, :S2]")
+        end
+
+        # accumulate traveltime
+        t_total += ds / (v_group + 1e-15)
+    end
+
+    return t_total
+end
 
 function inject_sources!(solid::Solid3D, T, source_mask, sources_phys, scheme, wavemode) 
 
@@ -769,30 +872,9 @@ function inject_sources!(solid::Solid3D, T, source_mask, sources_phys, scheme, w
                     sy = sources_phys[is][2]
                     sz = sources_phys[is][3]
 
-                    # distance
-                    r = sqrt((sx - xg)^2 + (sy - yg)^2 + (sz - zg)^2)
-                    if r == 0 
-                        T[i,j,k] = 0 
-                        continue 
-                    end
-
-                    # unit normal n src -> point  
-                    dxi = xg - sx
-                    dyi = yg - sy
-                    dzi = zg - sz
-                    n = SVector(dxi, dyi, dzi) / (1e-10 + sqrt(dxi^2 + dyi^2 + dzi^2))
-
-                    gp_pkt, gs1_pkt, gs2_pkt = group_velocity(VpVs, UpUs, solid, n, i, j, k)
-                    gp_src, gs1_src, gs2_src = group_velocity(VpVs, UpUs, solid, n, ix, iy, iz)
-
-                    # This might be not very accurate for strong heterogenities around the source
-                    if wavemode == :P 
-                        T[i,j,k] = r / ((1e-10 + norm(gp_pkt) + norm(gp_src))/2)
-                    elseif wavemode == :S1 
-                        T[i,j,k] = r / ((1e-10 + norm(gs1_pkt) + norm(gs1_src))/2)
-                    elseif wavemode == :S2
-                        T[i,j,k] = r / ((1e-10 + norm(gs2_pkt) + norm(gs2_src))/2)
-                    end
+                    # traveltime 
+                    t_ray = traveltime_along_straight_ray(solid, sx, sy, sz, xg, yg, zg, wavemode; n_segments=10)
+                    T[i,j,k] = t_ray
                 end
             end
         end 
