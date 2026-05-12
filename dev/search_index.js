@@ -1,3 +1,3 @@
 var documenterSearchIndex = {"docs":
-[{"location":"#SeisTimes","page":"Home","title":"SeisTimes","text":"Documentation for SeisTimes.\n\n","category":"section"}]
+[{"category":"section","location":"#SeisTimes","page":"Home","text":"Documentation for SeisTimes.\n\n","title":"SeisTimes"}]
 }
