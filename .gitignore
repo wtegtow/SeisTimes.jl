@@ -2,5 +2,6 @@
 /docs/Manifest.toml
 /docs/build/
 /.vscode
-/dev
+/.dev
 /.DS_Store
+/.venv

@@ -2,5 +2,5 @@ using SeisTimes
 using Test
 
 @testset "SeisTimes.jl" begin
-    # Write your tests here.
+    println("No tests yet.")
 end

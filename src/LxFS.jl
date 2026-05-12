@@ -1,362 +1,411 @@
-# ========================================
-# Helper
-# ========================================
+# ============================================================
+# Velocity model parser
+# ============================================================
 
-function L2!(buf, x, y)
-    @. buf = x - y
-    return norm(buf)
-end
+const _VELMOD_NFIELDS_2D = 7
+const _VELMOD_NFIELDS_3D = 13
 
-function L∞!(buf, x, y)
-    @. buf = abs(x - y)
-    return maximum(buf)
-end
+function _load_velmod_file(path::String)::AbstractArray
+    @assert ispath(path) "Velocity model file not found: $path"
 
-function ΦWENO(a,b,c,d)
-    ϵ_tol = 1e-8
+    if endswith(path, ".npz")
+        file = npzread(path)
+        @assert haskey(file, "velmod") "NPZ file does not contain key \"velmod\""
+        return file["velmod"]
 
-    IS0 = 13*(a - b)^2 + 3*(a - 3b)^2
-    IS1 = 13*(b - c)^2 + 3*(b + c)^2
-    IS2 = 13*(c - d)^2 + 3*(3c - d)^2
+    elseif endswith(path, ".npy")
+        return npzread(path)
 
-    α0 = 1/(ϵ_tol + IS0)^2
-    α1 = 6/(ϵ_tol + IS1)^2
-    α2 = 3/(ϵ_tol + IS2)^2
+    elseif endswith(path, ".jld2")
+        file = jldopen(path)
+        @assert haskey(file, "velmod") "JLD2 file does not contain key \"velmod\""
+        arr = file["velmod"]
+        close(file)
+        return arr
 
-    w0 = α0 / (α0 + α1 + α2)
-    w2 = α2 / (α0 + α1 + α2)
-
-    ϕweno = (1/3) * w0 * (a - 2b + c) + (1/6) * (w2 - 0.5) * (b - 2c + d)
-    return ϕweno
-end
-
-# ========================================
-# 2D 
-# ========================================
-
-struct Solid2D{V, I}
-    x_coords::V
-    z_coords::V
-    c11::I 
-    c13::I 
-    c33::I 
-    c55::I
-   
-    function Solid2D(x_coords, z_coords, vp, vs; eps=0.0, del=0.0)
-        μ = @. vs^2
-        λ = @. vp^2 - 2*μ
-        # density normalized stiffness
-        c11 = @. ((λ + 2μ) * (2*eps .+ 1))
-        c13 = @. (λ + del * (λ + 2μ)) 
-        c33 = @. (λ + 2μ) 
-        c55 = @. (μ) 
-
-        new{typeof(x_coords), typeof(c11)}(
-            x_coords, z_coords, c11, c13, c33, c55)
+    else
+        error("Unsupported velocity model format. Supported: .npy, .npz, .jld2")
     end
 end
 
-function Γn(solid::Solid2D, n, i, k)
-    # Christoffel matrix Γ(n) = n C n 
-    Γ = @SMatrix[
-         solid.c11[i,k] * n[1]^2 + solid.c55[i,k] * n[2]^2  (solid.c13[i,k] + solid.c55[i,k]) * n[1] * n[2]    ;
-        (solid.c13[i,k] + solid.c55[i,k]) * n[1] * n[2]      solid.c55[i,k] * n[1]^2 + solid.c33[i,k] * n[2]^2
-        ]
-    return Γ
+function _check_velmod(arr::AbstractArray)
+    nd = ndims(arr)
+    if nd == 3
+        size(arr, 1) == _VELMOD_NFIELDS_2D || error("3-D velmod must have $_VELMOD_NFIELDS_2D fields in dim 1, got $(size(arr,1))")
+    elseif nd == 4
+        size(arr, 1) == _VELMOD_NFIELDS_3D || error("4-D velmod must have $_VELMOD_NFIELDS_3D fields in dim 1, got $(size(arr,1))")
+    else
+        error("Expected 3-D (2D sim) or 4-D (3D sim) array, got $(nd)-D")
+    end
+    all(isfinite, arr) || error("Velmod contains NaN or Inf")
 end
 
-function solve_christoffel!(VpVs::MVector{2,Float64}, UpUs::MMatrix{2,2,Float64}, solid::Solid2D, n::SVector{2,Float64}, i::Int, k::Int)
-    Γ = Γn(solid, n, i, k)  
-    F = eigen(Γ)           
-    V = F.values
-    U = F.vectors
-    # P -> 1, S -> 2
-    VpVs[1] = sqrt(real(V[2]))  
-    VpVs[2] = sqrt(real(V[1]))  
-    UpUs[:,1] .= U[:,2]         
-    UpUs[:,2] .= U[:,1]         
+function parse_velmod(input::Union{String, AbstractArray})
+    arr = input isa String ? _load_velmod_file(input) : input
+    _check_velmod(arr)
+    return arr
 end
 
-function group_velocity(VpVs::MVector{2,Float64}, UpUs::MMatrix{2,2,Float64}, solid::Solid2D, n, i, k)
+# ============================================================
+# Stiffness & solid 
+# ============================================================
 
-    # solve for slowness vector P
-    solve_christoffel!(VpVs, UpUs, solid, n, i, k)
-    Pp = n ./ VpVs[1]
-    Ps = n ./ VpVs[2]
-
-    # solve for group velocity vector 
-    ΓUp = Γn(solid, UpUs[:,1], i, k)
-    ΓUs = Γn(solid, UpUs[:,2], i, k)
-    @einsum gp[i] := ΓUp[i,j] * Pp[j]
-    @einsum gs[i] := ΓUs[i,j] * Ps[j]
-    @assert dot(gp,Pp) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for P wave"
-    @assert dot(gs,Ps) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for S wave"
-    return (gp, gs)
+struct Stiffness2D
+    c11::Float64; c13::Float64; c33::Float64; c55::Float64
 end
 
-function LxFS1(T, i, k, dx, dz)
-    return SVector(T[i+1,k], T[i-1,k],  T[i,k+1],  T[i,k-1])
+struct Stiffness3D
+    c33::Float64; c55::Float64; c11::Float64; c22::Float64
+    c66::Float64; c44::Float64; c13::Float64; c23::Float64; c12::Float64
 end
 
-function LxFS3(T, i, k, dx, dz)
-
-    ϵ_tol = 1e-8
-
-    denom_x = (ϵ_tol + (T[i+1,k] - 2*T[i,k] + T[i-1,k])^2)
-    denom_z = (ϵ_tol + (T[i,k+1] - 2*T[i,k] + T[i,k-1])^2)
-
-    γ_p_x =   (ϵ_tol + (T[i,k] - 2*T[i+1,k] + T[i+2,k])^2) / denom_x
-    γ_m_x =   (ϵ_tol + (T[i,k] - 2*T[i-1,k] + T[i-2,k])^2) / denom_x
-    γ_p_z =   (ϵ_tol + (T[i,k] - 2*T[i,k+1] + T[i,k+2])^2) / denom_z
-    γ_m_z =   (ϵ_tol + (T[i,k] - 2*T[i,k-1] + T[i,k-2])^2) / denom_z
-
-    ω_p_x = 1 / (1 + 2 * γ_p_x^2)
-    ω_m_x = 1 / (1 + 2 * γ_m_x^2)
-    ω_p_z = 1 / (1 + 2 * γ_p_z^2)
-    ω_m_z = 1 / (1 + 2 * γ_m_z^2)
-
-    tp_x_ = (1 - ω_p_x) / (2 * dx) * (T[i+1,k] - T[i-1,k]) +  ω_p_x  / (2 * dx) * (-3*T[i,k] + 4*T[i+1,k] - T[i+2,k])
-    tm_x_ = (1 - ω_m_x) / (2 * dx) * (T[i+1,k] - T[i-1,k]) +  ω_m_x  / (2 * dx) * ( 3*T[i,k] - 4*T[i-1,k] + T[i-2,k])
-    tp_z_ = (1 - ω_p_z) / (2 * dz) * (T[i,k+1] - T[i,k-1]) +  ω_p_z  / (2 * dz) * (-3*T[i,k] + 4*T[i,k+1] - T[i,k+2])
-    tm_z_ = (1 - ω_m_z) / (2 * dz) * (T[i,k+1] - T[i,k-1]) +  ω_m_z  / (2 * dz) * ( 3*T[i,k] - 4*T[i,k-1] + T[i,k-2])
-
-    return SVector(T[i,k] + dx * tp_x_, 
-                   T[i,k] - dx * tm_x_,  
-                   T[i,k] + dz * tp_z_,  
-                   T[i,k] - dz * tm_z_)
+struct Solid{D,S}
+    coords::NTuple{D,AbstractVector{Float64}}
+    unique_stiffnesses::Vector{S}
+    stiffness_ids::Array{Int,D}
 end
 
-
-function LxFS5(T, i, k, dx, dz)
-    #   Operator
-    #   Δ⁺ₓ φᵢⱼ = φᵢ₊₁ⱼ − φᵢⱼ       # forward difference in x
-    #   Δ⁻ₓ φᵢⱼ = φᵢⱼ   − φᵢ₋₁ⱼ     # backward difference in x
-    #   Δ⁺𝓏 φᵢⱼ = φᵢⱼ₊₁ − φᵢⱼ       # forward difference in z
-    #   Δ⁻𝓏 φᵢⱼ = φᵢⱼ   − φᵢⱼ₋₁     # backward difference in z
-
-    Δpx_m2 = (T[i-1, k] - T[i-2, k]) / dx   # Δ⁺φ_{i−2,j}
-    Δpx_m1 = (T[i,   k] - T[i-1, k]) / dx   # Δ⁺φ_{i−1,j}
-    Δpx_0  = (T[i+1, k] - T[i,   k]) / dx   # Δ⁺φ_{i,j}
-    Δpx_p1 = (T[i+2, k] - T[i+1, k]) / dx   # Δ⁺φ_{i+1,j}
-
-    Δpz_m2 = (T[i, k-1] - T[i, k-2]) / dz   # Δ⁺φ_{i,j−2}
-    Δpz_m1 = (T[i,   k] - T[i, k-1]) / dz   # Δ⁺φ_{i,j−1}
-    Δpz_0  = (T[i, k+1] - T[i,   k]) / dz   # Δ⁺φ_{i,j}
-    Δpz_p1 = (T[i, k+2] - T[i, k+1]) / dz   # Δ⁺φ_{i,j+1}
-
-    # WENO parameter a,b,c,d
-    axp = (T[i+3, k] - 2*T[i+2,k] + T[i+1, k]) / dx
-    axm = (T[i-3, k] - 2*T[i-2,k] + T[i-1, k]) / dx
-    azp = (T[i, k+3] - 2*T[i,k+2] + T[i, k+1]) / dz
-    azm = (T[i, k-3] - 2*T[i,k-2] + T[i, k-1]) / dz
-
-    bxp = (T[i+2, k] - 2*T[i+1,k] + T[i, k]) / dx
-    bxm = (T[i-2, k] - 2*T[i-1,k] + T[i, k]) / dx
-    bzp = (T[i, k+2] - 2*T[i,k+1] + T[i, k]) / dz
-    bzm = (T[i, k-2] - 2*T[i,k-1] + T[i, k]) / dz
-
-    cxp = (T[i+1, k] - 2*T[i,k] + T[i-1, k]) / dx
-    cxm = (T[i+1, k] - 2*T[i,k] + T[i-1, k]) / dx
-    czp = (T[i, k+1] - 2*T[i,k] + T[i, k-1]) / dz
-    czm = (T[i, k+1] - 2*T[i,k] + T[i, k-1]) / dz
-
-    dxp = (T[i-2, k] - 2*T[i-1,k] + T[i, k]) / dx
-    dxm = (T[i+2, k] - 2*T[i+1,k] + T[i, k]) / dx
-    dzp = (T[i, k-2] - 2*T[i,k-1] + T[i, k]) / dz
-    dzm = (T[i, k+2] - 2*T[i,k+1] + T[i, k]) / dz
-
-    ϕweno_xp = ΦWENO(axp,bxp,cxp,dxp)
-    ϕweno_xm = ΦWENO(axm,bxm,cxm,dxm)
-    ϕweno_zp = ΦWENO(azp,bzp,czp,dzp)
-    ϕweno_zm = ΦWENO(azm,bzm,czm,dzm)
-
-    tp_x_ = 1/12 * (-Δpx_m2 + 7*Δpx_m1 + 7*Δpx_0 - Δpx_p1) + ϕweno_xp
-    tm_x_ = 1/12 * (-Δpx_m2 + 7*Δpx_m1 + 7*Δpx_0 - Δpx_p1) - ϕweno_xm
-
-    tp_z_ = 1/12 * (-Δpz_m2 + 7*Δpz_m1 + 7*Δpz_0 - Δpz_p1) + ϕweno_zp
-    tm_z_ = 1/12 * (-Δpz_m2 + 7*Δpz_m1 + 7*Δpz_0 - Δpz_p1) - ϕweno_zm
-
-    return SVector(T[i,k] + dx * tp_x_, 
-                   T[i,k] - dx * tm_x_,  
-                   T[i,k] + dz * tp_z_,  
-                   T[i,k] - dz * tm_z_)
+function build_stiffness_map(stiffness_array)
+    unique_c  = Vector{eltype(stiffness_array)}()
+    val_to_idx = Dict{eltype(stiffness_array),Int}()
+    ids = similar(stiffness_array, Int)
+    for I in CartesianIndices(stiffness_array)
+        c = stiffness_array[I]
+        idx = get!(val_to_idx, c) do
+            push!(unique_c, c)
+            length(unique_c)
+        end
+        ids[I] = idx
+    end
+    return unique_c, ids
 end
 
-function compute_viscosities(solid::Solid2D; deg_increment=3, buffer_factor=2)
+@inline get_stiffness(solid::Solid{2}, I::CartesianIndex{2}) = solid.unique_stiffnesses[solid.stiffness_ids[I]]
+@inline get_stiffness(solid::Solid{3}, I::CartesianIndex{3}) = solid.unique_stiffnesses[solid.stiffness_ids[I]]
 
-    C = ([ (solid.c11[i,k], 
-            solid.c13[i,k], 
-            solid.c33[i,k], 
-            solid.c55[i,k]) 
-            for i in axes(solid.c11,1), k in axes(solid.c11,2)
-        ])
-                        
-    unique_C = unique(C)
-    indices_C = [findfirst(==(val), C) for val in unique_C]
-    n_unique_C = length(unique_C)
+function Solid(velmod::AbstractArray{T,3}) where T
+    x_coords = velmod[1, :, 1]
+    z_coords = velmod[2, 1, :]
+    vp  = velmod[3, :, :]
+    vs  = velmod[4, :, :]
+    eps = velmod[6, :, :]
+    del = velmod[7, :, :]
+    c33 = @. vp^2
+    c55 = @. vs^2
+    c11 = @. c33 * (2*eps + 1)
+    c13 = @. (c33 - 2*c55) + del * c33
+    stiffness_array = Stiffness2D.(c11, c13, c33, c55)
+    unique_c, ids = build_stiffness_map(stiffness_array)
+    Solid{2, Stiffness2D}((x_coords, z_coords), unique_c, ids)
+end
 
-    angles_theta = deg2rad.(0:deg_increment:360)
-    n_theta = length(angles_theta)
+function Solid(velmod::AbstractArray{T,4}) where T
+    x_coords = velmod[1, :, 1, 1]
+    y_coords = velmod[2, 1, :, 1]
+    z_coords = velmod[3, 1, 1, :]
+    vp   = velmod[4, :, :, :]
+    vs   = velmod[5, :, :, :]
+    eps1 = velmod[7, :, :, :]
+    eps2 = velmod[8, :, :, :]
+    gam1 = velmod[9, :, :, :]
+    gam2 = velmod[10, :, :, :]
+    del1 = velmod[11, :, :, :]
+    del2 = velmod[12, :, :, :]
+    del3 = velmod[13, :, :, :]
+    c33 = @. vp^2
+    c55 = @. vs^2
+    c11 = @. (2*eps2 + 1) * c33
+    c22 = @. (2*eps1 + 1) * c33
+    c66 = @. (2*gam1 + 1) * c55
+    c44 = @. c66 / (1 + 2*gam2)
+    c13 = @. sqrt(2*c33*(c33-c55)*del2 + (c33-c55)^2) - c55
+    c23 = @. sqrt(2*c33*(c33-c44)*del1 + (c33-c44)^2) - c44
+    c12 = @. sqrt(2*c11*(c11-c66)*del3 + (c11-c66)^2) - c66
+    stiffness_array = Stiffness3D.(c33, c55, c11, c22, c66, c44, c13, c23, c12)
+    unique_c, ids = build_stiffness_map(stiffness_array)
+    Solid{3, Stiffness3D}((x_coords, y_coords, z_coords), unique_c, ids)
+end
 
-    visc_p = zeros(n_unique_C, n_theta, 2);
-    visc_s = zeros(n_unique_C, n_theta, 2);
+# ============================================================
+# Phase & group velocity
+# ============================================================
+@inline function Γn(c::Stiffness2D, n::SVector{2})
+    n1, n2 = n
+    return @SMatrix [
+        c.c11*n1^2 + c.c55*n2^2      (c.c13+c.c55)*n1*n2;
+        (c.c13+c.c55)*n1*n2           c.c55*n1^2 + c.c33*n2^2
+    ]
+end
 
-    VpVs = MVector{2,Float64}(undef)
-    UpUs = MMatrix{2,2,Float64}(undef)
+@inline function Γn(c::Stiffness3D, n::SVector{3,T}) where T
+    n1, n2, n3 = n
+    return @SMatrix [
+         c.c11*n1^2+c.c66*n2^2+c.c55*n3^2 (c.c12+c.c66)*n1*n2                (c.c13+c.c55)*n1*n3;
+        (c.c12+c.c66)*n1*n2                c.c66*n1^2+c.c22*n2^2+c.c44*n3^2  (c.c23+c.c44)*n2*n3;
+        (c.c13+c.c55)*n1*n3               (c.c23+c.c44)*n2*n3                 c.c55*n1^2+c.c44*n2^2+c.c33*n3^2
+    ]
+end
 
-    for c in 1:n_unique_C
-        c_idx = indices_C[c]
-        
-        for (theta_idx, theta) in enumerate(angles_theta)
+@inline _eigvals_2d(a, b, d) = begin
+    s = (a + d) * 0.5; t = sqrt(((a - d) * 0.5)^2 + b^2)
+    s + t, s - t   # λP, λS
+end
 
-            n = SVector(cos(theta), sin(theta))
-            n = n/norm(n)
+# Compute eigenvalues of symmetric 3x3 matrix using closed-form solution (Cardano's method). see, e.g.,
+# Siddique, Abu Bakar, and Tariq A. Khraishi. 
+# Eigenvalues and eigenvectors for 3×3 symmetric matrices: an analytical approach."
+# Journal of Advances in Mathematics and Computer Science 35.7 (2020): 106-118.
+@inline function _eigvals_3d(A11, A22, A33, A12, A13, A23)
+    q   = (A11 + A22 + A33) / 3.0
+    B11 = A11-q;  B22 = A22-q;  B33 = A33-q
+    p2  = B11*B11 + B22*B22 + B33*B33 + 2.0*(A12*A12 + A13*A13 + A23*A23)
+    p   = sqrt(p2 / 6.0)
+    p < 1e-14 && return q, q, q, true   # degenerate (isotropic)
+    inv_p = 1.0 / p
+    C11=B11*inv_p; C22=B22*inv_p; C33=B33*inv_p
+    C12=A12*inv_p; C13=A13*inv_p; C23=A23*inv_p
+    r   = (C11*(C22*C33 - C23*C23) - C12*(C12*C33 - C23*C13) + C13*(C12*C23 - C22*C13)) * 0.5
+    phi = acos(clamp(r, -1.0, 1.0)) / 3.0
+    λ1  = q + 2p*cos(phi)
+    λ3  = q + 2p*cos(phi + 2π/3)
+    return λ1, 3q - λ1 - λ3, λ3, false
+end
 
-            gp, gs = group_velocity(VpVs, UpUs, solid, n, c_idx[1], c_idx[2])
+@inline function phase_velocity(c::Stiffness2D, n::SVector{2,Float64}, mode::Int)
+    Γ = Γn(c, n)
+    λP, λS = _eigvals_2d(Γ[1,1], Γ[1,2], Γ[2,2])
+    return mode == 1 ? sqrt(max(λP, 0.0)) : sqrt(max(λS, 0.0))
+end
 
-            ∂H∂P = -gp ./ VpVs[1]
-            ∂H∂S = -gs ./ VpVs[2]
+@inline function phase_velocity(c::Stiffness3D, n::SVector{3,Float64}, mode::Int)
+    Γ = Γn(c, n)
+    λ1, λ2, λ3, _ = _eigvals_3d(Γ[1,1], Γ[2,2], Γ[3,3], Γ[1,2], Γ[1,3], Γ[2,3])
+    return mode == 1 ? sqrt(max(λ1, 0.0)) : mode == 2 ? sqrt(max(λ2, 0.0)) : sqrt(max(λ3, 0.0))
+end
 
-            visc_p[c,theta_idx,:] .= abs.(∂H∂P) .* buffer_factor
-            visc_s[c,theta_idx,:] .= abs.(∂H∂S) .* buffer_factor
+# Group velocity g_m = Γ(u_m) · (n / v_m).
+function group_velocity(c::Union{Stiffness2D,Stiffness3D}, n::SVector{D,Float64}, mode::Int) where D
+    Γ = Γn(c, n)
+    F = eigen(Γ)
+    idx = D - mode + 1 # ascending → mode 1 = last
+    λ = real(F.values[idx])
+    v = sqrt(max(λ, 0.0))
+    v < 1e-15 && return zero(SVector{D,Float64})
+    u = SVector{D,Float64}(real.(F.vectors[:, idx]))
+    return Γn(c, u) * (n / v)
+end
 
+# ============================================================
+# Artificial viscosity 
+# ============================================================
+
+function _sample_directions(::Val{2}, deg_increment)
+    [(cos(θ), sin(θ)) for θ in deg2rad.(0:deg_increment:360)]
+end
+
+function _sample_directions(::Val{3}, deg_increment)
+    [(sin(φ)*cos(θ), sin(φ)*sin(θ), cos(φ))
+     for θ in deg2rad.(0:deg_increment:360)
+     for φ in deg2rad.(0:deg_increment:90)]
+end
+
+function compute_viscosities(solid::Solid{D,S}; deg_increment=3, viscosity_buffer=2.0) where {D,S}
+    n_modes = D
+    directions = _sample_directions(Val(D), deg_increment)
+
+    # [mode][dim] → maximum group velocity component seen over all stiffnesses/directions
+    max_visc = zeros(Float64, n_modes, D)
+
+    for c in solid.unique_stiffnesses
+        for raw_n in directions
+            n_sv = SVector{D,Float64}(raw_n)
+            nn   = norm(n_sv)
+            nn < 1e-15 && continue
+            n = n_sv / nn
+            for m in 1:n_modes
+                v_m = phase_velocity(c, n, m)
+                v_m < 1e-15 && continue
+                g_m = group_velocity(c, n, m)
+                for d in 1:D
+                    max_visc[m, d] = max(max_visc[m, d], abs(g_m[d] / v_m * viscosity_buffer))
+                end
+            end
         end
     end
 
-    visc_p = Float64[maximum(visc_p[:,:,1]), maximum(visc_p[:,:,2])]
-    visc_s = Float64[maximum(visc_s[:,:,1]), maximum(visc_s[:,:,2])]
-    return visc_p, visc_s;
-end;
-
-function use_sources!(T, source_mask, sources_phys, INF)
-    # source_phys = pre-computed initial traveltimes
-    # stencil sizes must be considered before.
-    # works for 2D and 3D
-    # values elsewhere must be NaN
-    @assert size(T) == size(sources_phys) ""
-    T .= sources_phys  
-    source_mask .= .!isnan.(T)
-    T[isnan.(T)] .= INF
+    return ntuple(m -> SVector{D,Float64}(ntuple(d -> max_visc[m, d], D)), n_modes)
 end
 
-function traveltime_along_straight_ray(solid::Solid2D, sx, sz, xg, zg, wavemode; n_segments=10)
-    """
-    Compute traveltime along straight ray from source (sx, sz) to grid point (xg, zg).
-    Note: This is an approximation of the true traveltime, but it is used as initial condition for the fast sweeping method. 
-    Exact traveltime injection will be implemented in the future.
-    """
-    
-    r = sqrt((xg - sx)^2 + (zg - sz)^2)
-    if r == 0.0
-        return 0.0
+# ============================================================
+# Source initialization
+# ============================================================
+function parse_source(sources::Union{String, AbstractVector, Tuple})
+    if sources isa String
+        isfile(sources) || error("Source file not found: $sources")
+        mat = readdlm(sources, Float64)
+        nrow = size(mat, 1)
+        sources = [Tuple(mat[i, :]) for i in 1:nrow]
     end
+    for src in sources
+        @assert length(src) in (2, 3) "Each source must be (x,z) or (x,y,z)"
+        @assert all(isfinite, src) "Source coordinates must be finite"
+    end
+    return sources
+end
 
-    # ray direction 
-    n = SVector((xg - sx) / r, (zg - sz) / r)
+# Dirty workaround to initiate source cube
+function traveltime_straight_ray(solid::Solid{D}, src, x_grid, mode; n_segments=10) where D
+    r = sqrt(sum((x_grid[d] - src[d])^2 for d in 1:D))
+    r < 1e-15 && return 0.0
 
-    # segment length
-    ds = r / n_segments
-
-    VpVs = MVector{2,Float64}(undef)
-    UpUs = MMatrix{2,2,Float64}(undef)
-
-    nx = length(solid.x_coords)
-    nz = length(solid.z_coords)
-    dx = solid.x_coords[2] - solid.x_coords[1]
-    dz = solid.z_coords[2] - solid.z_coords[1]
-    x0 = solid.x_coords[1]
-    z0 = solid.z_coords[1]
+    n_hat    = SVector{D,Float64}(ntuple(d -> (x_grid[d] - src[d]) / r, Val(D)))
+    ds       = r / n_segments
+    spacings = ntuple(d -> solid.coords[d][2] - solid.coords[d][1], Val(D))
+    origins  = ntuple(d -> solid.coords[d][1], Val(D))
+    gsizes   = ntuple(d -> length(solid.coords[d]), Val(D))
 
     t_total = 0.0
-
     for seg in 1:n_segments
-        # midpoint of segment
         frac = (seg - 0.5) / n_segments
-        xm = sx + frac * (xg - sx)
-        zm = sz + frac * (zg - sz)
-
-        # find nearest grid indices for midpoint 
-        im = clamp(round(Int, (xm - x0) / dx) + 1, 1, nx)
-        km = clamp(round(Int, (zm - z0) / dz) + 1, 1, nz)
-
-        # group velocity at midpoint in ray direction
-        gp, gs = group_velocity(VpVs, UpUs, solid, n, im, km)
-
-        if wavemode == :P
-            v_group = norm(gp)
-        elseif wavemode == :S
-            v_group = norm(gs)
-        else
-            error("wavemode $(wavemode) not in [:P, :S]")
-        end
-
-        # accumulate traveltime
-        t_total += ds / (v_group + 1e-15)
+        I_near = CartesianIndex(ntuple(Val(D)) do d
+            xm = src[d] + frac * (x_grid[d] - src[d])
+            clamp(round(Int, (xm - origins[d]) / spacings[d]) + 1, 1, gsizes[d])
+        end)
+        c = get_stiffness(solid, I_near)
+        g_m = group_velocity(c, n_hat, mode)
+        t_total += ds / (norm(g_m) + 1e-15)
     end
-
     return t_total
 end
 
-function inject_sources!(solid::Solid2D, T, source_mask, sources_phys, scheme, wavemode) 
-
-    source_center_ids = Tuple{Int, Int}[(argmin(abs.(solid.x_coords .- x)), 
-                                         argmin(abs.(solid.z_coords .- z))) 
-                                         for (x, z) in sources_phys]
-                    
-    cell_size = scheme == :LxFS1 ? 0 :
-                scheme == :LxFS3 ? 1 :
-                scheme == :LxFS5 ? 2 :
-                error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
-
-    VpVs = MVector{2,Float64}(undef)
-    UpUs = MMatrix{2,2,Float64}(undef)
-    
-    nx, nz = length(solid.x_coords), length(solid.z_coords)
-    for (is,(ix, iz)) in enumerate(source_center_ids)
-        for i in clamp(ix-cell_size, 1, nx):clamp(ix+cell_size, 1, nx)
-            for k in clamp(iz-cell_size, 1, nz):clamp(iz+cell_size, 1, nz)
-
-                source_mask[i, k] = true 
-
-                # physical location at grid 
-                xg = solid.x_coords[i]
-                zg = solid.z_coords[k]
-
-                # physical location of source 
-                sx = sources_phys[is][1]
-                sz = sources_phys[is][2]
-
-                # traveltime 
-                t_ray = traveltime_along_straight_ray(solid, sx, sz, xg, zg, wavemode; n_segments=10) # yet not very accurate if source region is heterogenious.
-                T[i,k] = t_ray
-                
-            end
-        end 
+# TODO: local ray tracing to refine traveltime estimates in source region
+function init_source_region!(solid::Solid{D}, T, source_mask, src, cell_size::Int, mode::Int) where D
+    gsizes = ntuple(d -> length(solid.coords[d]), Val(D))
+    center = ntuple(Val(D)) do d
+        argmin(abs.(solid.coords[d] .- src[d]))
+    end
+    ranges = ntuple(Val(D)) do d
+        clamp(center[d] - cell_size, 1, gsizes[d]):clamp(center[d] + cell_size, 1, gsizes[d])
+    end
+    for idx in Iterators.product(ranges...)
+        I = CartesianIndex(idx)
+        source_mask[I] = true
+        x_grid = ntuple(d -> solid.coords[d][idx[d]], Val(D))
+        T[I] = traveltime_straight_ray(solid, src, x_grid, mode)
     end
 end
 
+# ============================================================
+# LxFS scheme (per-dimension stencils)
+# ============================================================
 
-function calc_time!(solid::Solid2D, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, k, dx, dz)
+abstract type LxFSScheme end
+struct LxFS1 <: LxFSScheme end
+struct LxFS3 <: LxFSScheme end
+struct LxFS5 <: LxFSScheme end
 
-    tp_x, tm_x, tp_z, tm_z = lxfs(T, i, k, dx, dz)
-    
-    p = SVector((tp_x - tm_x) / (2dx), (tp_z - tm_z) / (2dz))
-    p_norm = norm(p)
-    if p_norm == 0 return end 
-    p /= p_norm
+stencil_width(::LxFS1) = 1
+stencil_width(::LxFS3) = 2
+stencil_width(::LxFS5) = 3
 
-    solve_christoffel!(VpVs, UpUs, solid, p, i, k)
-
-    H = 1/VpVs[velocity_index] - p_norm 
-    A = 1/(viscosities[1]/dx + viscosities[2]/dz)
-    C = viscosities[1] * ((tp_x + tm_x)/(2*dx)) + viscosities[2] * ((tp_z + tm_z)/(2*dz))
-    T_new = A * (H + C)
-    T[i, k] = min(T_new, T[i, k])
-
+@inline function stencil_dim(::LxFS1, T, I, ed, Δd)
+    return (T[I + ed], T[I - ed])
 end
 
-function calc_bcs!(T, nx, nz, N)
-    # outflow bc's
+@inline function stencil_dim(::LxFS3, T, I, ed, Δd)
+    ϵ = 1e-8
+    T0  = T[I]
+    Tp1 = T[I + ed];   Tm1 = T[I - ed]
+    Tp2 = T[I + 2*ed]; Tm2 = T[I - 2*ed]
+    denom = ϵ + (Tp1 - 2*T0 + Tm1)^2
+    γ_p   = (ϵ + (T0 - 2*Tp1 + Tp2)^2) / denom
+    γ_m   = (ϵ + (T0 - 2*Tm1 + Tm2)^2) / denom
+    ω_p   = 1 / (1 + 2*γ_p^2)
+    ω_m   = 1 / (1 + 2*γ_m^2)
+    tp = (1-ω_p)/(2*Δd)*(Tp1-Tm1) + ω_p/(2*Δd)*(-3*T0 + 4*Tp1 - Tp2)
+    tm = (1-ω_m)/(2*Δd)*(Tp1-Tm1) + ω_m/(2*Δd)*( 3*T0 - 4*Tm1 + Tm2)
+    return (T0 + Δd*tp, T0 - Δd*tm)
+end
+
+@inline function ΦWENO(a, b, c, d)
+    ϵ = 1e-8
+    IS0 = 13*(a-b)^2 + 3*(a-3*b)^2
+    IS1 = 13*(b-c)^2 + 3*(b+c)^2
+    IS2 = 13*(c-d)^2 + 3*(3*c-d)^2
+    α0 = 1/(ϵ+IS0)^2
+    α1 = 6/(ϵ+IS1)^2
+    α2 = 3/(ϵ+IS2)^2
+    Σ  = α0 + α1 + α2
+    return (1/3)*(α0/Σ)*(a-2*b+c) + (1/6)*((α2/Σ)-0.5)*(b-2*c+d)
+end
+
+@inline function stencil_dim(::LxFS5, T, I, ed, Δd)
+    T0  = T[I]
+    Tp1 = T[I + 1*ed]; Tm1 = T[I - 1*ed]
+    Tp2 = T[I + 2*ed]; Tm2 = T[I - 2*ed]
+    Tp3 = T[I + 3*ed]; Tm3 = T[I - 3*ed]
+    inv_Δd = 1 / Δd
+    Δp_m2 = (Tm1 - Tm2) * inv_Δd
+    Δp_m1 = (T0  - Tm1) * inv_Δd
+    Δp_0  = (Tp1 - T0)  * inv_Δd
+    Δp_p1 = (Tp2 - Tp1) * inv_Δd
+    a_p = (Tp3 - 2*Tp2 + Tp1) * inv_Δd
+    a_m = (Tm3 - 2*Tm2 + Tm1) * inv_Δd
+    b_p = (Tp2 - 2*Tp1 + T0)  * inv_Δd
+    b_m = (Tm2 - 2*Tm1 + T0)  * inv_Δd
+    c_  = (Tp1 - 2*T0  + Tm1) * inv_Δd
+    base = (1/12) * (-Δp_m2 + 7*Δp_m1 + 7*Δp_0 - Δp_p1)
+    tp   = base + ΦWENO(a_p, b_p, c_, b_m)
+    tm   = base - ΦWENO(a_m, b_m, c_, b_p)
+    return (T0 + Δd*tp, T0 - Δd*tm)
+end
+
+# ============================================================
+# LxFS update (multi-dimensional)
+# ============================================================
+
+@inline function unit_offset(::Val{D}, d::Int) where D
+    CartesianIndex(ntuple(i -> i == d ? 1 : 0, Val(D)))
+end
+
+@inline function calc_time!(
+        T, I::CartesianIndex{D}, scheme::LxFSScheme,
+        spacings::NTuple{D,Float64}, solid::Solid{D},
+        viscosities::SVector{D,Float64},
+        velocity_index::Int) where D
+
+    Φ = ntuple(Val(D)) do d
+        ed = unit_offset(Val(D), d)
+        stencil_dim(scheme, T, I, ed, spacings[d])
+    end
+
+    p = SVector{D,Float64}(ntuple(Val(D)) do d
+        (Φ[d][1] - Φ[d][2]) / (2 * spacings[d])
+    end)
+
+    p_norm = norm(p)
+    (!isfinite(p_norm) || p_norm == 0) && return
+    n_hat = p / p_norm
+
+    c = get_stiffness(solid, I)
+    v_phase = phase_velocity(c, n_hat, velocity_index)
+
+    H = 1 / v_phase - p_norm
+    A = 1 / sum(ntuple(d -> viscosities[d] / spacings[d], Val(D)))
+    C = sum(ntuple(Val(D)) do d
+        viscosities[d] * (Φ[d][1] + Φ[d][2]) / (2 * spacings[d])
+    end)
+
+    T[I] = min(A * (H + C), T[I])
+end
+
+# ============================================================
+# Outflow boundary conditions
+# ============================================================
+
+# TODO: refactor to multidimensional loop with CartesianIndices and unit offsets
+function calc_bcs!(T, grid_sizes::NTuple{2,Int}, N)
+    nx, nz = grid_sizes
     for i in 1:nx, n in 1:N
         T[i,n] = min(max(2*T[i,n+1] - T[i,n+2], T[i,n+2]), T[i,n])
         k = nz - n + 1
@@ -369,543 +418,8 @@ function calc_bcs!(T, nx, nz, N)
     end
 end
 
-function fast_sweep(solid::Solid2D, 
-                    sources_phys, 
-                    wavemode, 
-                    scheme; 
-                    verbose=false,
-                    max_iter=200,
-                    max_error_tol = 1e-5,
-                    viscosity_buffer = 1.5)
-
-    # params 
-    INF = 1e10 # initial value
-
-    x_coords = solid.x_coords
-    dx = x_coords[2] - x_coords[1]
-    nx = length(x_coords)
-
-    z_coords = solid.z_coords
-    dz = z_coords[2] - z_coords[1]
-    nz = length(z_coords)
-
-    VpVs = MVector{2,Float64}(undef)
-    UpUs = MMatrix{2,2,Float64}(undef)
-
-    # calculate artificial viscosities
-    visc_p, visc_s = compute_viscosities(solid; buffer_factor=viscosity_buffer);
-
-    # select wavemode
-    if wavemode == :P 
-        velocity_index = 1
-        viscosities = visc_p
-    elseif wavemode == :S
-        velocity_index = 2
-        viscosities = visc_s
-    else 
-        error("wavemode $(wavemode) not in ['P', 'S']")
-    end 
-
-    # select scheme 
-    if scheme == :LxFS1 
-        lxfs = LxFS1 
-        N = 1
-    elseif scheme == :LxFS3 
-        lxfs = LxFS3
-        N = 2
-    elseif scheme == :LxFS5
-        lxfs = LxFS5
-        N = 3
-    else 
-        error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
-    end
-
-    # sources
-    T     = fill(INF, nx, nz)
-    T_old = fill(INF, nx, nz)
-    source_mask = falses(nx, nz)
-    if size(sources_phys) == (nx, nz)
-        use_sources!(T, source_mask, sources_phys, INF)
-    else
-        inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode)
-    end
-
-    # fast sweep 
-    inner_sweeps = (
-        (1+N:1:nx-N , 1+N:1:nz-N), 
-        (nx-N:-1:1+N, 1+N:1:nz-N), 
-        (1+N:1:nx-N, nz-N:-1:1+N),
-        (nx-N:-1:1+N, nz-N:-1:1+N)
-    )
-
-    converged = false
-    diverged  = false
-    L2_error = INF
-    L∞_error = INF
-    E = similar(T)
-
-    if verbose 
-        println("===============================================")
-        println("Compute Traveltimes: $(wavemode)")
-        @printf("Grid Size: %d, %d\n", nx, nz)
-        @printf("Viscosities: %.2e | %.2e \n", viscosities[1], viscosities[2])
-        println("===============================================")
-    end 
-
-    for iter in 1:max_iter
-
-        if verbose
-        @printf("Iter: %5d | L2: %.5e | L∞: %.5e\n", iter, L2_error, L∞_error)
-        end
-
-        @inbounds begin 
-        for (x_order, z_order) in inner_sweeps
-            for i in x_order, k in z_order
-                if !source_mask[i, k]
-                    calc_time!(solid, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, k, dx, dz)
-                end
-            end
-            calc_bcs!(T, nx, nz, N)
-        end
-        end
-
-        L2_error = L2!(E, T, T_old)
-        L∞_error = L∞!(E, T, T_old)
-
-        # check convergence
-        if L∞_error  < max_error_tol
-            println("Solution converged after $(iter) iterations.")
-            converged = true
-            break
-        end
-
-        # check divergence 
-        if any(T .< 0) || any(T .> INF*10) 
-            println("Solution diverged. Try larger viscosity_buffer than $(viscosity_buffer).")
-            diverged = true
-            break
-        end
-
-        T_old .= T
-
-    end
-
-    if !converged && !diverged
-        println("Solution not converged. Try larger max_iter than $(max_iter).")
-    end
-
-    return (T=T, converged=converged)
-
-end
-
-# ========================================
-# 3D
-# ========================================
-
-struct Solid3D{V, I}
-    x_coords::V
-    y_coords::V
-    z_coords::V
-    c33::I
-    c55::I
-    c11::I
-    c22::I
-    c66::I
-    c44::I
-    c13::I
-    c23::I
-    c12::I
-   
-    function Solid3D(x_coords, y_coords, z_coords, vp, vs; 
-                    eps1=0., eps2=0., gam1=0., gam2=0., 
-                    del1=0., del2=0., del3=0.)
-
-        # density normalized stiffness
-        c33 = @. vp^2
-        c55 = @. vs^2
-        c11 = @. (2*eps2 + 1) * c33
-        c22 = @. (2*eps1 + 1) * c33
-        c66 = @. (2*gam1 + 1) * c55
-        c44 = @. c66 / (1 + gam2)
-        c13 = @. sqrt(2 * c33 * (c33 - c55) * del2 + (c33 - c55)^2) - c55
-        c23 = @. sqrt(2 * c33 * (c33 - c44) * del1 + (c33 - c44)^2) - c44
-        c12 = @. sqrt(2 * c11 * (c11 - c66) * del3 + (c11 - c66)^2) - c66
-
-        new{typeof(x_coords), typeof(c11)}(
-            x_coords, y_coords, z_coords,
-            c33, c55, c11, c22, c66, c44, c13, c23, c12)
-    end
-end
-
-function Γn(solid::Solid3D, n, i::Int, j::Int, k::Int)
-
-    # Christoffel matrix Γ(n) = n C n 
-    c11, c12, c13 = solid.c11[i,j,k], solid.c12[i,j,k], solid.c13[i,j,k]
-    c22, c23      = solid.c22[i,j,k], solid.c23[i,j,k]
-    c33           = solid.c33[i,j,k]
-    c44, c55, c66 = solid.c44[i,j,k], solid.c55[i,j,k], solid.c66[i,j,k]
-    n1, n2, n3 = n[1], n[2], n[3]
-
-    Γ = @SMatrix[
-         c11 * n1^2 + c66 * n2^2 + c55 * n3^2  (c12 + c66) * n1 * n2                   (c13 + c55) * n1 * n3;
-        (c12 + c66) * n1 * n2                   c66 * n1^2 + c22 * n2^2 + c44 * n3^2   (c23 + c44) * n2 * n3;
-        (c13 + c55) * n1 * n3                  (c23 + c44) * n2 * n3                    c55 * n1^2 + c44 * n2^2 + c33 * n3^2
-    ]
-    return Γ
-end
-
-function solve_christoffel!(VpVs::MVector{3,Float64}, UpUs::MMatrix{3,3,Float64}, solid::Solid3D, n, i::Int, j::Int, k::Int) 
-
-    Γ = Γn(solid, n, i, j, k)  
-    F = eigen(Γ)           
-    V = F.values
-    U = F.vectors
-    # P -> 1, S1 -> 2, S2 -> 3
-    VpVs[1] = sqrt(real(V[3]))  
-    VpVs[2] = sqrt(real(V[2]))  
-    VpVs[3] = sqrt(real(V[1])) 
-    UpUs[:,1] .= U[:,3]         
-    UpUs[:,2] .= U[:,2]       
-    UpUs[:,3] .= U[:,1]   
-end
-
-function group_velocity(VpVs::MVector{3,Float64}, UpUs::MMatrix{3,3,Float64}, solid::Solid3D, n, i, j, k)
-
-    # solve for slowness vector P
-    solve_christoffel!(VpVs, UpUs, solid, n, i, j, k)
-    Pp  = n ./ VpVs[1]
-    Ps1 = n ./ VpVs[2]
-    Ps2 = n ./ VpVs[3]
-
-    # solve for group velocity vector
-    ΓUp  = Γn(solid, UpUs[:,1], i, j, k)
-    ΓUs1 = Γn(solid, UpUs[:,2], i, j, k)
-    ΓUs2 = Γn(solid, UpUs[:,3], i, j, k)
-    @einsum  gp[i] := ΓUp[i,j] * Pp[j]
-    @einsum gs1[i] := ΓUs1[i,j] * Ps1[j]
-    @einsum gs2[i] := ΓUs2[i,j] * Ps2[j]
-    @assert dot(gp,Pp) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for P wave"
-    @assert dot(gs1,Ps1) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for S1 wave"
-    @assert dot(gs2,Ps2) ≈ 1 rtol=1e-3 "Group velocity condition not satisfied for S2 wave"
-    return (gp, gs1, gs2)
-end
-
-function LxFS1(T, i, j, k, dx, dy, dz)
-    return SVector(T[i+1,j,k], T[i-1,j,k],  
-                   T[i,j+1,k], T[i,j-1,k],
-                   T[i,j,k+1], T[i,j,k-1])
-end
-
-function LxFS3(T, i, j, k, dx, dy, dz)
-
-    ϵ_tol = 1e-8
-
-    denom_x = (ϵ_tol + (T[i+1,j,k] - 2*T[i,j,k] + T[i-1,j,k])^2)
-    denom_y = (ϵ_tol + (T[i,j+1,k] - 2*T[i,j,k] + T[i,j-1,k])^2)
-    denom_z = (ϵ_tol + (T[i,j,k+1] - 2*T[i,j,k] + T[i,j,k-1])^2)
-
-    γ_p_x =   (ϵ_tol + (T[i,j,k] - 2*T[i+1,j,k] + T[i+2,j,k])^2) / denom_x
-    γ_m_x =   (ϵ_tol + (T[i,j,k] - 2*T[i-1,j,k] + T[i-2,j,k])^2) / denom_x
-    γ_p_y =   (ϵ_tol + (T[i,j,k] - 2*T[i,j+1,k] + T[i,j+2,k])^2) / denom_y
-    γ_m_y =   (ϵ_tol + (T[i,j,k] - 2*T[i,j-1,k] + T[i,j-2,k])^2) / denom_y
-    γ_p_z =   (ϵ_tol + (T[i,j,k] - 2*T[i,j,k+1] + T[i,j,k+2])^2) / denom_z
-    γ_m_z =   (ϵ_tol + (T[i,j,k] - 2*T[i,j,k-1] + T[i,j,k-2])^2) / denom_z
-
-    ω_p_x = 1 / (1 + 2 * γ_p_x^2)
-    ω_m_x = 1 / (1 + 2 * γ_m_x^2)
-    ω_p_y = 1 / (1 + 2 * γ_p_y^2)
-    ω_m_y = 1 / (1 + 2 * γ_m_y^2)
-    ω_p_z = 1 / (1 + 2 * γ_p_z^2)
-    ω_m_z = 1 / (1 + 2 * γ_m_z^2)
-
-    tp_x_ = (1 - ω_p_x) / (2 * dx) * (T[i+1,j,k] - T[i-1,j,k]) +  ω_p_x  / (2 * dx) * (-3*T[i,j,k] + 4*T[i+1,j,k] - T[i+2,j,k])
-    tm_x_ = (1 - ω_m_x) / (2 * dx) * (T[i+1,j,k] - T[i-1,j,k]) +  ω_m_x  / (2 * dx) * ( 3*T[i,j,k] - 4*T[i-1,j,k] + T[i-2,j,k])
-
-    tp_y_ = (1 - ω_p_y) / (2 * dy) * (T[i,j+1,k] - T[i,j-1,k]) +  ω_p_y  / (2 * dy) * (-3*T[i,j,k] + 4*T[i,j+1,k] - T[i,j+2,k])
-    tm_y_ = (1 - ω_m_y) / (2 * dy) * (T[i,j+1,k] - T[i,j-1,k]) +  ω_m_y  / (2 * dy) * ( 3*T[i,j,k] - 4*T[i,j-1,k] + T[i,j-2,k])
-
-    tp_z_ = (1 - ω_p_z) / (2 * dz) * (T[i,j,k+1] - T[i,j,k-1]) +  ω_p_z  / (2 * dz) * (-3*T[i,j,k] + 4*T[i,j,k+1] - T[i,j,k+2])
-    tm_z_ = (1 - ω_m_z) / (2 * dz) * (T[i,j,k+1] - T[i,j,k-1]) +  ω_m_z  / (2 * dz) * ( 3*T[i,j,k] - 4*T[i,j,k-1] + T[i,j,k-2])
-
-    return SVector(T[i,j,k] + dx * tp_x_, 
-                   T[i,j,k] - dx * tm_x_,  
-                   T[i,j,k] + dy * tp_y_, 
-                   T[i,j,k] - dy * tm_y_,
-                   T[i,j,k] + dz * tp_z_,  
-                   T[i,j,k] - dz * tm_z_)
-end
-
-
-function LxFS5(T, i, j, k, dx, dy, dz)
-    #   Operator
-    #   Δ⁺ₓ φᵢⱼ = φᵢ₊₁ⱼ − φᵢⱼ       # forward difference in x
-    #   Δ⁻ₓ φᵢⱼ = φᵢⱼ   − φᵢ₋₁ⱼ     # backward difference in x
-
-    Δpx_m2 = (T[i-1, j, k] - T[i-2, j, k]) / dx   
-    Δpx_m1 = (T[i,   j, k] - T[i-1, j, k]) / dx   
-    Δpx_0  = (T[i+1, j, k] - T[i,   j, k]) / dx  
-    Δpx_p1 = (T[i+2, j, k] - T[i+1, j, k]) / dx   
-
-    Δpy_m2 = (T[i, j-1, k] - T[i, j-2, k]) / dy
-    Δpy_m1 = (T[i, j,   k] - T[i, j-1, k]) / dy   
-    Δpy_0  = (T[i, j+1, k] - T[i, j,   k]) / dy
-    Δpy_p1 = (T[i, j+2, k] - T[i, j+1, k]) / dy   
-
-    Δpz_m2 = (T[i, j, k-1] - T[i, j, k-2]) / dz   
-    Δpz_m1 = (T[i, j,   k] - T[i, j, k-1]) / dz 
-    Δpz_0  = (T[i, j, k+1] - T[i, j,   k]) / dz   
-    Δpz_p1 = (T[i, j, k+2] - T[i, j, k+1]) / dz  
-
-    # WENO parameter a,b,c,d
-    axp = (T[i+3,j,k] - 2*T[i+2,j,k] + T[i+1,j,k]) / dx
-    axm = (T[i-3,j,k] - 2*T[i-2,j,k] + T[i-1,j,k]) / dx
-
-    ayp = (T[i,j+3,k] - 2*T[i,j+2,k] + T[i,j+1,k]) / dy
-    aym = (T[i,j-3,k] - 2*T[i,j-2,k] + T[i,j-1,k]) / dy
-
-    azp = (T[i,j,k+3] - 2*T[i,j,k+2] + T[i,j,k+1]) / dz
-    azm = (T[i,j,k-3] - 2*T[i,j,k-2] + T[i,j,k-1]) / dz
-
-    bxp = (T[i+2,j,k] - 2*T[i+1,j,k] + T[i,j,k]) / dx
-    bxm = (T[i-2,j,k] - 2*T[i-1,j,k] + T[i,j,k]) / dx
-
-    byp = (T[i,j+2,k] - 2*T[i,j+1,k] + T[i,j,k]) / dy
-    bym = (T[i,j-2,k] - 2*T[i,j-1,k] + T[i,j,k]) / dy
-
-    bzp = (T[i,j,k+2] - 2*T[i,j,k+1] + T[i,j,k]) / dz
-    bzm = (T[i,j,k-2] - 2*T[i,j,k-1] + T[i,j,k]) / dz
-
-    cxp = (T[i+1,j,k] - 2*T[i,j,k] + T[i-1,j,k]) / dx
-    cxm = (T[i+1,j,k] - 2*T[i,j,k] + T[i-1,j,k]) / dx
-
-    cyp = (T[i,j+1,k] - 2*T[i,j,k] + T[i,j-1,k]) / dy
-    cym = (T[i,j+1,k] - 2*T[i,j,k] + T[i,j-1,k]) / dy
-
-    czp = (T[i,j,k+1] - 2*T[i,j,k] + T[i,j,k-1]) / dz
-    czm = (T[i,j,k+1] - 2*T[i,j,k] + T[i,j,k-1]) / dz
-
-    dxp = (T[i-2,j,k] - 2*T[i-1,j,k] + T[i,j,k]) / dx
-    dxm = (T[i+2,j,k] - 2*T[i+1,j,k] + T[i,j,k]) / dx
-
-    dyp = (T[i,j-2,k] - 2*T[i,j-1,k] + T[i,j,k]) / dy
-    dym = (T[i,j+2,k] - 2*T[i,j+1,k] + T[i,j,k]) / dy
-
-    dzp = (T[i,j,k-2] - 2*T[i,j,k-1] + T[i,j,k]) / dz
-    dzm = (T[i,j,k+2] - 2*T[i,j,k+1] + T[i,j,k]) / dz
-
-    ϕweno_xp = ΦWENO(axp,bxp,cxp,dxp)
-    ϕweno_xm = ΦWENO(axm,bxm,cxm,dxm)
-
-    ϕweno_yp = ΦWENO(ayp,byp,cyp,dyp)
-    ϕweno_ym = ΦWENO(aym,bym,cym,dym)
-
-    ϕweno_zp = ΦWENO(azp,bzp,czp,dzp)
-    ϕweno_zm = ΦWENO(azm,bzm,czm,dzm)
-
-    tp_x_ = 1/12 * (-Δpx_m2 + 7*Δpx_m1 + 7*Δpx_0 - Δpx_p1) + ϕweno_xp
-    tm_x_ = 1/12 * (-Δpx_m2 + 7*Δpx_m1 + 7*Δpx_0 - Δpx_p1) - ϕweno_xm
-
-    tp_y_ = 1/12 * (-Δpy_m2 + 7*Δpy_m1 + 7*Δpy_0 - Δpy_p1) + ϕweno_yp
-    tm_y_ = 1/12 * (-Δpy_m2 + 7*Δpy_m1 + 7*Δpy_0 - Δpy_p1) - ϕweno_ym
-
-    tp_z_ = 1/12 * (-Δpz_m2 + 7*Δpz_m1 + 7*Δpz_0 - Δpz_p1) + ϕweno_zp
-    tm_z_ = 1/12 * (-Δpz_m2 + 7*Δpz_m1 + 7*Δpz_0 - Δpz_p1) - ϕweno_zm
-
-    return SVector(T[i,j,k] + dx * tp_x_, 
-                   T[i,j,k] - dx * tm_x_,  
-                   T[i,j,k] + dy * tp_y_, 
-                   T[i,j,k] - dy * tm_y_,
-                   T[i,j,k] + dz * tp_z_,  
-                   T[i,j,k] - dz * tm_z_)
-end
-
-function compute_viscosities(solid::Solid3D; deg_increment=3, buffer_factor=2)
-
-    # assembling C for every grid point
-    C = ([ (solid.c11[i,j,k], solid.c12[i,j,k], solid.c13[i,j,k],
-                              solid.c22[i,j,k], solid.c23[i,j,k],
-            solid.c44[i,j,k], solid.c55[i,j,k], solid.c66[i,j,k]) 
-            for i in axes(solid.c11,1), j in axes(solid.c11,2), k in axes(solid.c11,3)
-        ])
-                        
-    unique_C = unique(C)
-    indices_C = [findfirst(==(val), C) for val in unique_C]
-    n_unique_C = length(unique_C)
-    
-    angles_theta = deg2rad.(0:deg_increment:360)
-    n_theta = length(angles_theta)
-
-    angles_phi = deg2rad.(0:deg_increment:90)
-    n_phi =length(angles_phi)
-
-    visc_p  = zeros(n_unique_C, n_theta, n_phi, 3);
-    visc_s1 = zeros(n_unique_C, n_theta, n_phi, 3);
-    visc_s2 = zeros(n_unique_C, n_theta, n_phi, 3);
-
-    VpVs = MVector{3,Float64}(undef)
-    UpUs = MMatrix{3,3,Float64}(undef)
-
-    for c in 1:n_unique_C
-        c_idx = indices_C[c]
-        
-        for (theta_idx, theta) in enumerate(angles_theta)
-            for (phi_idx, phi) in enumerate(angles_phi)
-
-                n = SVector(sin(phi)*cos(theta), sin(phi)*sin(theta), cos(phi))
-                n = n/norm(n)
-                
-                gp, gs1, gs2 = group_velocity(VpVs, UpUs, solid, n, c_idx[1], c_idx[2], c_idx[3])
-
-                ∂H∂P  = -gp  ./ VpVs[1]
-                ∂H∂S1 = -gs1 ./ VpVs[2]
-                ∂H∂S2 = -gs2 ./ VpVs[3]
-                
-                visc_p[c,theta_idx,phi_idx,:]  .= abs.(∂H∂P)  .* buffer_factor
-                visc_s1[c,theta_idx,phi_idx,:] .= abs.(∂H∂S1) .* buffer_factor
-                visc_s2[c,theta_idx,phi_idx,:] .= abs.(∂H∂S2) .* buffer_factor
-            end
-        end
-    end
-
-    visc_p  = Float64[maximum(visc_p[:,:,:,1]),  maximum(visc_p[:,:,:,2]),  maximum(visc_p[:,:,:,3])]
-    visc_s1 = Float64[maximum(visc_s1[:,:,:,1]), maximum(visc_s1[:,:,:,2]), maximum(visc_s1[:,:,:,3])]
-    visc_s2 = Float64[maximum(visc_s2[:,:,:,1]), maximum(visc_s2[:,:,:,2]), maximum(visc_s2[:,:,:,3])]
-    return visc_p, visc_s1, visc_s2
-end
-
-function traveltime_along_straight_ray(solid::Solid3D, sx, sy, sz, xg, yg, zg, wavemode; n_segments=10)
-    """
-    Compute traveltime along straight ray from source (sx, sy, sz) to grid point (xg, yg, zg).
-    Note: This is an approximation of the true traveltime, but it is used as initial condition for the fast sweeping method. 
-    Exact traveltime injection will be implemented in the future.
-    """
-    
-    r = sqrt((xg - sx)^2 + (yg - sy)^2 + (zg - sz)^2)
-    if r == 0.0
-        return 0.0
-    end
-
-    # ray direction 
-    n = SVector((xg - sx) / r, (yg - sy) / r, (zg - sz) / r)
-
-    # segment length
-    ds = r / n_segments
-
-    VpVs = MVector{3,Float64}(undef)
-    UpUs = MMatrix{3,3,Float64}(undef)
-
-    nx = length(solid.x_coords)
-    ny = length(solid.y_coords)
-    nz = length(solid.z_coords)
-    dx = solid.x_coords[2] - solid.x_coords[1]
-    dy = solid.y_coords[2] - solid.y_coords[1]
-    dz = solid.z_coords[2] - solid.z_coords[1]
-    x0 = solid.x_coords[1]
-    y0 = solid.y_coords[1]
-    z0 = solid.z_coords[1]
-
-    t_total = 0.0
-
-    for seg in 1:n_segments
-        # midpoint of segment
-        frac = (seg - 0.5) / n_segments
-        xm = sx + frac * (xg - sx)
-        ym = sy + frac * (yg - sy)
-        zm = sz + frac * (zg - sz)
-
-        # find nearest grid indices for midpoint 
-        im = clamp(round(Int, (xm - x0) / dx) + 1, 1, nx)
-        jm = clamp(round(Int, (ym - y0) / dy) + 1, 1, ny)
-        km = clamp(round(Int, (zm - z0) / dz) + 1, 1, nz)
-
-        # group velocity at midpoint in ray direction
-        gp, gs1, gs2 = group_velocity(VpVs, UpUs, solid, n, im, jm, km)
-
-        if wavemode == :P
-            v_group = norm(gp)
-        elseif wavemode == :S1
-            v_group = norm(gs1)
-        elseif wavemode == :S2
-            v_group = norm(gs2)
-        else
-            error("wavemode $(wavemode) not in [:P, :S1, :S2]")
-        end
-
-        # accumulate traveltime
-        t_total += ds / (v_group + 1e-15)
-    end
-
-    return t_total
-end
-
-function inject_sources!(solid::Solid3D, T, source_mask, sources_phys, scheme, wavemode) 
-
-    source_center_ids = Tuple{Int, Int, Int}[(argmin(abs.(solid.x_coords .- x)), 
-                                            argmin(abs.(solid.y_coords .- y)),
-                                            argmin(abs.(solid.z_coords .- z))
-                                            ) 
-                                            for (x, y, z) in sources_phys]
-                    
-    cell_size = scheme == :LxFS1 ? 0 :
-                scheme == :LxFS3 ? 1 :
-                scheme == :LxFS5 ? 2 :
-                error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
-
-    VpVs = MVector{3,Float64}(undef)
-    UpUs = MMatrix{3,3,Float64}(undef)
-    
-    nx, ny, nz = length(solid.x_coords), length(solid.y_coords), length(solid.z_coords)
-    for (is,(ix, iy, iz)) in enumerate(source_center_ids)
-        for i in clamp(ix-cell_size, 1, nx):clamp(ix+cell_size, 1, nx)
-            for j in clamp(iy-cell_size, 1, ny):clamp(iy+cell_size, 1, ny)
-                for k in clamp(iz-cell_size, 1, nz):clamp(iz+cell_size, 1, nz)
-
-                    source_mask[i, j, k] = true 
-                    
-                    # physical location at grid 
-                    xg = solid.x_coords[i]
-                    yg = solid.y_coords[j]
-                    zg = solid.z_coords[k]
-
-                    # physical location of source 
-                    sx = sources_phys[is][1]
-                    sy = sources_phys[is][2]
-                    sz = sources_phys[is][3]
-
-                    # traveltime 
-                    t_ray = traveltime_along_straight_ray(solid, sx, sy, sz, xg, yg, zg, wavemode; n_segments=10)
-                    T[i,j,k] = t_ray
-                end
-            end
-        end 
-    end
-end
-
-function calc_time!(solid::Solid3D, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, j, k, dx, dy, dz)
-
-    tp_x, tm_x, tp_y, tm_y, tp_z, tm_z = lxfs(T, i, j, k, dx, dy, dz)
-    
-    p = SVector((tp_x - tm_x) / (2dx), 
-                (tp_y - tm_y) / (2dy),
-                (tp_z - tm_z) / (2dz))
-    p_norm = sqrt(p[1]^2 + p[2]^2 + p[3]^2)
-    if p_norm == 0 return end 
-    p = p / p_norm
-
-    solve_christoffel!(VpVs, UpUs, solid, p, i, j, k)
-
-    H = 1/VpVs[velocity_index] - p_norm 
-    A = 1/(viscosities[1]/dx + viscosities[2]/dy + viscosities[3]/dz)
-    C = viscosities[1] * ((tp_x + tm_x)/(2*dx)) + 
-        viscosities[2] * ((tp_y + tm_y)/(2*dy)) + 
-        viscosities[3] * ((tp_z + tm_z)/(2*dz))
-
-    T_new = A * (H + C)
-    T[i,j,k] = min(T_new, T[i,j,k])
-end
-
-function calc_bcs!(T, nx, ny, nz, N)
-    # outflow bc's
+function calc_bcs!(T, grid_sizes::NTuple{3,Int}, N)
+    nx, ny, nz = grid_sizes
     for j in 1:ny, i in 1:nx, n in 1:N
         T[i,j,n] = min(max(2*T[i,j,n+1] - T[i,j,n+2], T[i,j,n+2]), T[i,j,n])
         k = nz - n + 1
@@ -923,143 +437,219 @@ function calc_bcs!(T, nx, ny, nz, N)
     end
 end
 
-function fast_sweep(solid::Solid3D, 
-                    sources_phys, 
-                    wavemode, 
-                    scheme; 
-                    verbose=false,
-                    max_iter=200,
-                    max_error_tol = 1e-5,
-                    viscosity_buffer = 1.5)
+# ============================================================
+# Fast Sweeping
+# ============================================================
 
-    # params 
-    INF = 1e10 # initial value
+const INF_VAL = 1e5
+wavemode_index(::Val{2}, m::Symbol) = m == :P ? 1 : m == :S  ? 2 : error("wavemode $m ∉ [:P, :S]")
+wavemode_index(::Val{3}, m::Symbol) = m == :P ? 1 : m == :S1 ? 2 : m == :S2 ? 3 : error("wavemode $m ∉ [:P, :S1, :S2]")
 
-    x_coords = solid.x_coords
-    dx = x_coords[2] - x_coords[1]
-    nx = length(x_coords)
+function scheme_from_symbol(s::Symbol)
+    s == :LxFS1 && return LxFS1()
+    s == :LxFS3 && return LxFS3()
+    s == :LxFS5 && return LxFS5()
+    error("scheme $s ∉ [:LxFS1, :LxFS3, :LxFS5]")
+end
 
-    y_coords = solid.y_coords
-    dy = y_coords[2] - y_coords[1]
-    ny = length(y_coords)
-
-    z_coords = solid.z_coords
-    dz = z_coords[2] - z_coords[1]
-    nz = length(z_coords)
-
-    VpVs = MVector{3,Float64}(undef)
-    UpUs = MMatrix{3,3,Float64}(undef)
-
-    # calculate artificial viscosities
-    visc_p, visc_s1, visc_s2 = compute_viscosities(solid; buffer_factor=viscosity_buffer);
-
-    # select wavemode
-    if wavemode == :P 
-        velocity_index = 1
-        viscosities = visc_p
-    elseif wavemode == :S1
-        velocity_index = 2
-        viscosities = visc_s1 
-    elseif wavemode == :S2
-        velocity_index = 3
-        viscosities = visc_s2
-    else 
-        error("wavemode $(wavemode) not in ['P', 'S1', 'S2']")
-    end 
-
-    # select scheme 
-    if scheme == :LxFS1 
-        lxfs = LxFS1 
-        N = 1
-    elseif scheme == :LxFS3 
-        lxfs = LxFS3
-        N = 2
-    elseif scheme == :LxFS5
-        lxfs = LxFS5
-        N = 3
-    else 
-        error("Scheme $(scheme) not in ['LxFS1', 'LxFS3', 'LxFS5']")
+function generate_sweeps(grid_sizes::NTuple{D,Int}, Ns::Int) where D
+    sweeps = NTuple{D,StepRange{Int,Int}}[]
+    for bits in 0:(2^D - 1)
+        push!(sweeps, ntuple(Val(D)) do d
+            lo = 1 + Ns; hi = grid_sizes[d] - Ns
+            (bits >> (d-1)) & 1 == 0 ? (lo:1:hi) : (hi:-1:lo)
+        end)
     end
+    return sweeps
+end
 
-    # sources
-    T     = fill(INF, nx, ny, nz)
-    T_old = fill(INF, nx, ny, nz)
-    source_mask = falses(nx, ny, nz)
+# Progress logger
+struct SweepLogger
+    nsrc::Int
+    lock::ReentrantLock
+    active::Bool
+    grid_sizes::Tuple
+    wavemode::Symbol
+end
 
-    if size(sources_phys) == (nx, ny, nz)
-        use_sources!(T, source_mask, sources_phys, INF)
-    else 
-        inject_sources!(solid, T, source_mask, sources_phys, scheme, wavemode)
+SweepLogger(nsrc::Int, active::Bool, grid_sizes::Tuple, wavemode::Symbol) =
+    SweepLogger(nsrc, ReentrantLock(), active, grid_sizes, wavemode)
+
+function _log_init!(lg::SweepLogger)
+    lg.active || return
+    grid_str = join(lg.grid_sizes, " × ")
+    println("─"^75)
+    println("Fast Sweeping for Eikonal Equation")
+    println("  Grid:     ", grid_str)
+    println("  Wavemode: ", lg.wavemode)
+    println("  Sources:  ", lg.nsrc,  "  | Available threads: ", Threads.nthreads())
+    println("─"^75)
+    for i in 1:lg.nsrc
+        @printf("Source %4d | Iter: %4s | L2: %11s | L∞: %11s\n", i, "—", "—", "—")
     end
+    flush(stdout)
+end
 
-    # fast sweep 
-    inner_sweeps = (
-        (1+N:1:nx-N,  1+N:1:ny-N,  1+N:1:nz-N),    
-        (1+N:1:nx-N,  1+N:1:ny-N,  nz-N:-1:1+N),   
-        (1+N:1:nx-N,  ny-N:-1:1+N, 1+N:1:nz-N),   
-        (1+N:1:nx-N,  ny-N:-1:1+N, nz-N:-1:1+N),  
-        (nx-N:-1:1+N, 1+N:1:ny-N,  1+N:1:nz-N),   
-        (nx-N:-1:1+N, 1+N:1:ny-N,  nz-N:-1:1+N),  
-        (nx-N:-1:1+N, ny-N:-1:1+N, 1+N:1:nz-N),  
-        (nx-N:-1:1+N, ny-N:-1:1+N, nz-N:-1:1+N) 
-    )
-
-    converged = false
-    diverged  = false
-    L2_error = INF
-    L∞_error = INF
-    E = fill(INF, nx, ny, nz)
-
-    if verbose 
-        println("===============================================")
-        println("Compute Traveltimes: $(wavemode)")
-        @printf("Grid Size: %d, %d, %d\n", nx, ny, nz)
-        @printf("Viscosities: %.2e | %.2e | %.2e\n", viscosities[1], viscosities[2], viscosities[3])
-        println("===============================================")
-    end 
-
-    for iter in 1:max_iter
-
-        if verbose
-        @printf("Iter: %5d | L2: %.5e | L∞: %.5e\n", iter, L2_error, L∞_error)
+function _log_update!(lg::SweepLogger, isrc::Int, iter::Int, l2::Float64, linf::Float64, note::String="")
+    lg.active || return
+    n_up = lg.nsrc - isrc + 1
+    lock(lg.lock) do
+        print("\e[$(n_up)A\r")
+        if isempty(note)
+            @printf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e", isrc, iter, l2, linf)
+        else
+            @printf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e  ← %s", isrc, iter, l2, linf, note)
         end
+        print("\e[$(n_up)B\r")
+        flush(stdout)
+    end
+end
 
-        @inbounds begin 
-        for (x_order, y_order, z_order) in inner_sweeps
-            for i in x_order, j in y_order, k in z_order
-                if !source_mask[i, j, k]
-                    calc_time!(solid, T, VpVs, UpUs, lxfs, viscosities, velocity_index, i, j, k, dx, dy, dz)
+_log_finish!(lg::SweepLogger) = lg.active && println()
+
+# IO 
+struct FastSweepResult{D}
+    traveltimes::AbstractArray{Float64,D}
+    converged::Bool
+    L2_error::Vector{Float64}
+    L∞_error::Vector{Float64}
+    time_taken::Float64
+end
+
+function save_fast_sweep_result(results::Vector{FastSweepResult{D}}, path::String) where D
+    h5open(path, "w") do fid
+        for (isrc, res) in enumerate(results)
+            grp = create_group(fid, "source_$isrc")
+            for fname in fieldnames(FastSweepResult{D})
+                val = getfield(res, fname)
+                if val isa AbstractArray
+                    grp[string(fname)] = Array(val)
+                elseif val isa Bool
+                    grp[string(fname)] = Int8(val)
+                else
+                    grp[string(fname)] = val
                 end
             end
-            calc_bcs!(T, nx, ny, nz, N)
         end
+    end
+end
+
+function load_fast_sweep_result(path::String, ::Val{D}) where D
+    path = endswith(path, ".h5") ? path : path * ".h5"
+    results = h5open(path, "r") do fid
+        nsrc = length(keys(fid))
+        map(1:nsrc) do isrc
+            grp = fid["source_$isrc"]
+            traveltimes = read(grp, "traveltimes")::Array{Float64,D}
+            converged   = Bool(read(grp, "converged"))
+            L2_error    = read(grp, "L2_error")::Vector{Float64}
+            L∞_error    = read(grp, "L∞_error")::Vector{Float64}
+            time_taken  = read(grp, "time_taken")::Float64
+            FastSweepResult{D}(traveltimes, converged, L2_error, L∞_error, time_taken)
         end
+    end
+    return results
+end
 
-        L2_error = L2!(E, T, T_old)
-        L∞_error = L∞!(E, T, T_old)
-        
-        # check convergence
-        if L∞_error  < max_error_tol
-            println("$(wavemode) Solution converged after $(iter) iterations.") 
-            converged = true
-            break
+
+# Main
+function fast_sweep(
+    velmod::Union{String, AbstractArray},
+    sources::Union{String, AbstractVector, Tuple},
+    wavemode::Symbol,
+    scheme::Symbol;
+    max_iter::Int  = 1000,
+    criterion::Symbol = :L8,
+    tol::Float64   = 1e-6,
+    viscosity_buffer::Float64 = 2.0,
+    verbose::Bool  = false,
+    save::Union{String, Nothing} = nothing,
+)
+    # check path
+    if !isnothing(save)
+        isempty(strip(save)) && error("save path must not be an empty string")
+        save = endswith(save, ".h5") || endswith(save, ".hdf5") ? save : save * ".h5"
+        save_dir = dirname(save)
+        if !isempty(save_dir) && !isdir(save_dir)
+            error("Save directory does not exist: $save_dir")
         end
-
-        # check divergence 
-        if any(T .< 0) || any(T .> INF*1e3)
-            println("$(wavemode) Solution diverged. Try larger viscosity_buffer than $(viscosity_buffer).")
-            diverged = true
-            break
-        end
-
-        T_old .= T
-
     end
 
-    if !converged && !diverged
-        println("$(wavemode) Solution not converged. Try larger max_iter than $(max_iter).")
+    solid       = Solid(parse_velmod(velmod))
+    sources     = parse_source(sources)
+    viscosities = compute_viscosities(solid, viscosity_buffer=viscosity_buffer)
+
+    D          = length(solid.coords)
+    wm_index   = wavemode_index(Val(D), wavemode)
+    lxfs       = scheme_from_symbol(scheme)
+    ns         = stencil_width(lxfs)
+    grid_sizes = ntuple(d -> length(solid.coords[d]), D)
+    spacings   = ntuple(d -> solid.coords[d][2] - solid.coords[d][1], Val(D))
+    colons     = ntuple(_ -> (:), D)
+    sweeps     = generate_sweeps(grid_sizes, ns)
+
+    T_grid = fill(INF_VAL, length(sources), grid_sizes...)
+    T_mask = falses(length(sources), grid_sizes...)
+
+    for s in eachindex(sources)
+        init_source_region!(solid, view(T_grid, s, colons...), view(T_mask, s, colons...),sources[s], ns, wm_index)
     end
 
-    return (T=T, converged=converged)
+    nsrc    = length(sources)
+    results = Vector{FastSweepResult{D}}(undef, nsrc)
+    lg      = SweepLogger(nsrc, verbose, grid_sizes, wavemode)
 
+    _log_init!(lg)
+
+    Threads.@threads for isrc in eachindex(sources)
+
+        t_grid       = view(T_grid, isrc, colons...)
+        t_mask       = view(T_mask, isrc, colons...)
+        t_old        = copy(t_grid)
+        error_buffer = similar(Array(t_grid))
+
+        t_start = time()
+        converged = false
+        L2_error  = Float64[INF_VAL]
+        L∞_error  = Float64[INF_VAL]
+
+        for iter in 1:max_iter
+
+            _log_update!(lg, isrc, iter, L2_error[end], L∞_error[end])
+
+            @inbounds for sweep_ranges in sweeps
+                for idx in Iterators.product(sweep_ranges...)
+                    I = CartesianIndex(idx)
+                    t_mask[I] || calc_time!(t_grid, I, lxfs, spacings, solid, viscosities[wm_index], wm_index)
+                end
+                calc_bcs!(t_grid, grid_sizes, ns)
+            end
+
+            if any(<(0), t_grid)
+                _log_update!(lg, isrc, iter, L2_error[end], L∞_error[end], "Unstable, try larger viscosity_buffer.")
+                break
+            end
+
+            @. error_buffer = t_grid - t_old
+            push!(L2_error, norm(error_buffer, 2))
+            push!(L∞_error, norm(error_buffer, Inf))
+
+            if criterion == :L2
+                L2_error[end] < tol && (converged = true; break)
+            elseif criterion == :L8
+                L∞_error[end] < tol && (converged = true; break)
+            else 
+                error("Unsupported convergence criterion: $criterion. Use :L2 or :L8.")
+            end
+
+            copyto!(t_old, t_grid)
+        end
+
+        results[isrc] = FastSweepResult{D}(t_grid, converged, L2_error, L∞_error, time() - t_start)
+    end
+
+    _log_finish!(lg)
+    !isnothing(save) && save_fast_sweep_result(results, save)
+
+    return results
 end
