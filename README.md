@@ -7,8 +7,8 @@ SeisTimes is a package for computing first-arrival seismic traveltimes in hetero
 
 # Implemented Methods
 
-- Wavefront construction via the Lax-Friedrichs (LxFS) approximation of the static Hamilton-Jacobi for the anisotropic eikonal equation.
-The solver uses a Fast Sweeping scheme on regular grids and supports 1st-, 3rd-, and 5th-order LxFS stencils.
+- Wavefront construction via the Lax-Friedrichs (LxFS) approximation of the anisotropic eikonal equation.
+The solver uses a Fast Sweeping scheme on regular grids and supports 1st-, 3rd-, and 5th-order stencils.
 
 # Installation
 
@@ -19,7 +19,7 @@ Pkg.add(url="https://github.com/wtegtow/SeisTimes.jl")
 
 # Quick Start
 
-The main function is `fast_sweep`. It takes a **velocity model array** and a list of sources, and returns a `Vector{FastSweepResult}` — one result per source.
+The wavefront construction main function is `fast_sweep`. It takes a **velocity model array** and a list of **sources**.
 
 ## Velocity Model Format
 
@@ -55,26 +55,28 @@ The velocity model is packed into a single array that stores both the coordinate
 | `[12,:,:,:]` | Tsvankin `δ₂` |
 | `[13,:,:,:]` | Tsvankin `δ₃` |
 
-The velmod array can also be passed as a file path (`.npy`, `.npz`, or `.jld2`).
+The velmod array can also be passed as a file path (`.npy`, `.npz` (field "velmod" required), or `.jld2`).
+
+## Sources Format
+Sources are packed into a vector of `(x,z)` or `(x,y,z)` tuples, or a path to a whitespace-delimited text file.
 
 ## `fast_sweep`
 
 ```julia
+# wavemode = :P or :S for 2D; :P, :S1, or :S2 for 3D
+# scheme O = :LxFS1, :LxFS3, or :LxFS5 (1st, 3rd, 5th order)
+
 results = fast_sweep(velmod, sources, wavemode, scheme;
     max_iter        = 1000,
     tol             = 1e-6,
     criterion       = :L8,       # :L2 or :L8 (L-infinity)
     viscosity_buffer = 2.0,      # numerical stabilizer (larger values stabilize, but slows down convergence)
-    verbose         = false,     # print progress in REPL or terminal
+    max_unique      = nothing,   # max. unique stiffnesses for exact viscosity, else viscosity_buffer 
+    log_level       = :info,     # :debug, :info, :warn or :error
+    verbose         = false,     # print per-iteration progress (L2 / L∞ errors) for each source
     save            = nothing,   # optional HDF5 output path
 )
 ```
-
-**Arguments:**
-- `velmod` — velocity model array `(7,nx,nz)` / `(13,nx,ny,nz)`, or a path to a `.npy` / `.npz` / `.jld2` file
-- `sources` — vector of `(x,z)` or `(x,y,z)` tuples, or a path to a whitespace-delimited text file
-- `wavemode` — `:P` or `:S` for 2D; `:P`, `:S1`, or `:S2` for 3D
-- `scheme` — `:LxFS1`, `:LxFS3`, or `:LxFS5` (1st, 3rd, 5th order)
 
 Multiple sources are computed in parallel via Julia threads. Set the number of threads with the `JULIA_NUM_THREADS` environment variable or the VS Code Julia extension settings.
 
@@ -112,8 +114,12 @@ eps = fill( 0.20, nx, nz)
 del = fill(-0.10, nx, nz)
 
 # meshgrid coordinates
-X = repeat(x_coords, 1, nz)
-Z = repeat(reshape(z_coords, 1, :), nx, 1)
+X = zeros(nx, nz)
+Z = zeros(nx, nz)
+for i in 1:nx, j in 1:nz
+    X[i, j] = x_coords[i]
+    Z[i, j] = z_coords[j]
+end
 
 # build isotropic and VTI velocity model arrays
 velmod_iso = zeros(7, nx, nz)
@@ -149,6 +155,7 @@ display(fig)
 
 ![2D Traveltime Example](docs/assets/img1.png)
 
+
 ## Save and Load Results
 
 ```julia
@@ -160,7 +167,7 @@ results = load_fast_sweep_result("results/tt.h5", Val(2)) # Val(2) for 2D, Val(3
 tt = results[1].traveltimes
 ```
 
-## 3D Example
+## 3D
 
 The 3D workflow is identical. Use a `(13, nx, ny, nz)` velmod array, provide `(x, y, z)` source tuples, and pick `:P`, `:S1`, or `:S2` as the wavemode. See the `examples/` folder for full use cases including multi-receiver traveltime grids and validation against full-waveform modelling.
 

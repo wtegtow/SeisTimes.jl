@@ -209,8 +209,20 @@ function _sample_directions(::Val{3}, deg_increment)
      for φ in deg2rad.(0:deg_increment:90)]
 end
 
-function compute_viscosities(solid::Solid{D,S}; deg_increment=3, viscosity_buffer=2.0) where {D,S}
-    n_modes = D
+function compute_viscosities(solid::Solid{D,S}; deg_increment=3, viscosity_buffer=2.0, max_unique=nothing) where {D,S}
+    n_modes    = D
+    n_unique   = length(solid.unique_stiffnesses)
+    max_unique = something(max_unique, D == 2 ? 1000 : 100) # default: 1000 (2D), 100 (3D)
+
+    # Too many unique stiffnesses → skip direction sampling, use buffer directly
+    if n_unique > max_unique
+        @logger :warn "Number of unique stiffnesses ($n_unique) exceeds max_unique ($max_unique). " *
+                      "Using viscosity_buffer ($viscosity_buffer) as artificial viscosity. " *
+                      "If unstable, increase viscosity_buffer or max_unique."
+        return ntuple(_ -> SVector{D,Float64}(ntuple(_ -> viscosity_buffer, D)), n_modes)
+    end
+
+    @logger :debug "Computing artificial viscosities for $n_unique unique stiffnesses"
     directions = _sample_directions(Val(D), deg_increment)
 
     # [mode][dim] → maximum group velocity component seen over all stiffnesses/directions
@@ -463,51 +475,7 @@ function generate_sweeps(grid_sizes::NTuple{D,Int}, Ns::Int) where D
     return sweeps
 end
 
-# Progress logger
-struct SweepLogger
-    nsrc::Int
-    lock::ReentrantLock
-    active::Bool
-    grid_sizes::Tuple
-    wavemode::Symbol
-end
-
-SweepLogger(nsrc::Int, active::Bool, grid_sizes::Tuple, wavemode::Symbol) =
-    SweepLogger(nsrc, ReentrantLock(), active, grid_sizes, wavemode)
-
-function _log_init!(lg::SweepLogger)
-    lg.active || return
-    grid_str = join(lg.grid_sizes, " × ")
-    println("─"^75)
-    println("Fast Sweeping for Eikonal Equation")
-    println("  Grid:     ", grid_str)
-    println("  Wavemode: ", lg.wavemode)
-    println("  Sources:  ", lg.nsrc,  "  | Available threads: ", Threads.nthreads())
-    println("─"^75)
-    for i in 1:lg.nsrc
-        @printf("Source %4d | Iter: %4s | L2: %11s | L∞: %11s\n", i, "—", "—", "—")
-    end
-    flush(stdout)
-end
-
-function _log_update!(lg::SweepLogger, isrc::Int, iter::Int, l2::Float64, linf::Float64, note::String="")
-    lg.active || return
-    n_up = lg.nsrc - isrc + 1
-    lock(lg.lock) do
-        print("\e[$(n_up)A\r")
-        if isempty(note)
-            @printf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e", isrc, iter, l2, linf)
-        else
-            @printf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e  ← %s", isrc, iter, l2, linf, note)
-        end
-        print("\e[$(n_up)B\r")
-        flush(stdout)
-    end
-end
-
-_log_finish!(lg::SweepLogger) = lg.active && println()
-
-# IO 
+# IO
 struct FastSweepResult{D}
     traveltimes::AbstractArray{Float64,D}
     converged::Bool
@@ -562,9 +530,13 @@ function fast_sweep(
     criterion::Symbol = :L8,
     tol::Float64   = 1e-6,
     viscosity_buffer::Float64 = 2.0,
+    max_unique::Union{Int, Nothing} = nothing,
+    log_level::Symbol = :info,
     verbose::Bool  = false,
     save::Union{String, Nothing} = nothing,
 )
+    set_log_level!(log_level)
+
     # check path
     if !isnothing(save)
         isempty(strip(save)) && error("save path must not be an empty string")
@@ -577,7 +549,6 @@ function fast_sweep(
 
     solid       = Solid(parse_velmod(velmod))
     sources     = parse_source(sources)
-    viscosities = compute_viscosities(solid, viscosity_buffer=viscosity_buffer)
 
     D          = length(solid.coords)
     wm_index   = wavemode_index(Val(D), wavemode)
@@ -588,6 +559,12 @@ function fast_sweep(
     colons     = ntuple(_ -> (:), D)
     sweeps     = generate_sweeps(grid_sizes, ns)
 
+    @logger :info "Fast sweeping | Grid: $(join(grid_sizes, " × ")) | Wavemode: $wavemode | Scheme: $scheme | " *
+                  "Sources: $(length(sources)) | Threads: $(Threads.nthreads())"
+
+    viscosities = compute_viscosities(solid; viscosity_buffer, max_unique)
+    @logger :debug "Artificial viscosities ($wavemode): $(viscosities[wm_index])"
+
     T_grid = fill(INF_VAL, length(sources), grid_sizes...)
     T_mask = falses(length(sources), grid_sizes...)
 
@@ -597,9 +574,6 @@ function fast_sweep(
 
     nsrc    = length(sources)
     results = Vector{FastSweepResult{D}}(undef, nsrc)
-    lg      = SweepLogger(nsrc, verbose, grid_sizes, wavemode)
-
-    _log_init!(lg)
 
     Threads.@threads for isrc in eachindex(sources)
 
@@ -615,8 +589,6 @@ function fast_sweep(
 
         for iter in 1:max_iter
 
-            _log_update!(lg, isrc, iter, L2_error[end], L∞_error[end])
-
             @inbounds for sweep_ranges in sweeps
                 for idx in Iterators.product(sweep_ranges...)
                     I = CartesianIndex(idx)
@@ -626,13 +598,14 @@ function fast_sweep(
             end
 
             if any(<(0), t_grid)
-                _log_update!(lg, isrc, iter, L2_error[end], L∞_error[end], "Unstable, try larger viscosity_buffer.")
+                @logger :warn "Source $isrc unstable at iteration $iter, try larger viscosity_buffer."
                 break
             end
 
             @. error_buffer = t_grid - t_old
             push!(L2_error, norm(error_buffer, 2))
             push!(L∞_error, norm(error_buffer, Inf))
+            verbose && println(@sprintf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e", isrc, iter, L2_error[end], L∞_error[end]))
 
             if criterion == :L2
                 L2_error[end] < tol && (converged = true; break)
@@ -645,10 +618,19 @@ function fast_sweep(
             copyto!(t_old, t_grid)
         end
 
-        results[isrc] = FastSweepResult{D}(t_grid, converged, L2_error, L∞_error, time() - t_start)
+        time_taken = time() - t_start
+        n_iter     = length(L2_error) - 1
+        if converged
+            @logger :info @sprintf("Source %d converged after %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
+                                   isrc, n_iter, L2_error[end], L∞_error[end], time_taken)
+        elseif n_iter == max_iter
+            @logger :warn @sprintf("Source %d did not converge within %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
+                                   isrc, max_iter, L2_error[end], L∞_error[end], time_taken)
+        end
+
+        results[isrc] = FastSweepResult{D}(t_grid, converged, L2_error, L∞_error, time_taken)
     end
 
-    _log_finish!(lg)
     !isnothing(save) && save_fast_sweep_result(results, save)
 
     return results
