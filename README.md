@@ -64,7 +64,7 @@ Sources are packed into a vector of `(x,z)` or `(x,y,z)` tuples, or a path to a 
 
 ```julia
 # wavemode = :P or :S for 2D; :P, :S1, or :S2 for 3D
-# scheme O = :LxFS1, :LxFS3, or :LxFS5 (1st, 3rd, 5th order)
+# scheme   = :LxFS1, :LxFS3, or :LxFS5 (1st, 3rd, 5th order)
 
 results = fast_sweep(velmod, sources, wavemode, scheme;
     max_iter        = 1000,
