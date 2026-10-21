@@ -73,7 +73,7 @@ results = fast_sweep(velmod, sources, wavemode, scheme;
     viscosity_buffer = 2.0,      # numerical stabilizer (larger values stabilize, but slows down convergence)
     max_unique      = nothing,   # max. unique stiffnesses for exact viscosity, else viscosity_buffer 
     log_level       = :info,     # :debug, :info, :warn or :error
-    verbose         = false,     # print per-iteration progress (L2 / L∞ errors) for each source
+    verbose         = false,     # live progress (iteration, L2 / L∞ errors)
     save            = nothing,   # optional HDF5 output path
 )
 ```

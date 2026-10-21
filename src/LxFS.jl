@@ -475,6 +475,35 @@ function generate_sweeps(grid_sizes::NTuple{D,Int}, Ns::Int) where D
     return sweeps
 end
 
+# Progress display: one line per source, updated in place
+struct SweepProgress
+    nsrc::Int
+    lock::ReentrantLock
+    active::Bool
+end
+
+SweepProgress(nsrc::Int, active::Bool) = SweepProgress(nsrc, ReentrantLock(), active)
+
+function _progress_init!(p::SweepProgress)
+    p.active || return
+    for i in 1:p.nsrc
+        @printf("Source %4d | Iter: %4s | L2: %11s | L∞: %11s\n", i, "—", "—", "—")
+    end
+    flush(stdout)
+end
+
+function _progress_update!(p::SweepProgress, isrc::Int, iter::Int, l2::Float64, linf::Float64, note::String="")
+    p.active || return
+    n_up = p.nsrc - isrc + 1
+    lock(p.lock) do
+        print("\e[$(n_up)A\r\e[2K")
+        @printf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e", isrc, iter, l2, linf)
+        isempty(note) || print("  ← ", note)
+        print("\e[$(n_up)B\r")
+        flush(stdout)
+    end
+end
+
 # IO
 struct FastSweepResult{D}
     traveltimes::AbstractArray{Float64,D}
@@ -572,8 +601,16 @@ function fast_sweep(
         init_source_region!(solid, view(T_grid, s, colons...), view(T_mask, s, colons...),sources[s], ns, wm_index)
     end
 
-    nsrc    = length(sources)
-    results = Vector{FastSweepResult{D}}(undef, nsrc)
+    nsrc     = length(sources)
+    results  = Vector{FastSweepResult{D}}(undef, nsrc)
+    progress = SweepProgress(nsrc, verbose)
+
+    # While the progress block is shown, per-source log lines are deferred until all sources
+    # are done, otherwise they would be printed into the block and break the in-place updates.
+    deferred = [Tuple{Symbol,String}[] for _ in 1:nsrc]
+    emit(isrc, level, msg) = verbose ? push!(deferred[isrc], (level, msg)) : @logger level msg
+
+    _progress_init!(progress)
 
     Threads.@threads for isrc in eachindex(sources)
 
@@ -598,14 +635,15 @@ function fast_sweep(
             end
 
             if any(<(0), t_grid)
-                @logger :warn "Source $isrc unstable at iteration $iter, try larger viscosity_buffer."
+                _progress_update!(progress, isrc, iter, L2_error[end], L∞_error[end], "unstable")
+                emit(isrc, :warn, "Source $isrc unstable at iteration $iter, try larger viscosity_buffer.")
                 break
             end
 
             @. error_buffer = t_grid - t_old
             push!(L2_error, norm(error_buffer, 2))
             push!(L∞_error, norm(error_buffer, Inf))
-            verbose && println(@sprintf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e", isrc, iter, L2_error[end], L∞_error[end]))
+            _progress_update!(progress, isrc, iter, L2_error[end], L∞_error[end])
 
             if criterion == :L2
                 L2_error[end] < tol && (converged = true; break)
@@ -621,14 +659,20 @@ function fast_sweep(
         time_taken = time() - t_start
         n_iter     = length(L2_error) - 1
         if converged
-            @logger :info @sprintf("Source %d converged after %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
-                                   isrc, n_iter, L2_error[end], L∞_error[end], time_taken)
+            _progress_update!(progress, isrc, n_iter, L2_error[end], L∞_error[end], @sprintf("converged (%.2f s)", time_taken))
+            emit(isrc, :info, @sprintf("Source %d converged after %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
+                                       isrc, n_iter, L2_error[end], L∞_error[end], time_taken))
         elseif n_iter == max_iter
-            @logger :warn @sprintf("Source %d did not converge within %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
-                                   isrc, max_iter, L2_error[end], L∞_error[end], time_taken)
+            _progress_update!(progress, isrc, n_iter, L2_error[end], L∞_error[end], "not converged")
+            emit(isrc, :warn, @sprintf("Source %d did not converge within %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
+                                       isrc, max_iter, L2_error[end], L∞_error[end], time_taken))
         end
 
         results[isrc] = FastSweepResult{D}(t_grid, converged, L2_error, L∞_error, time_taken)
+    end
+
+    for msgs in deferred, (level, msg) in msgs
+        @logger level msg
     end
 
     !isnothing(save) && save_fast_sweep_result(results, save)
