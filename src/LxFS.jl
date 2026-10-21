@@ -475,34 +475,39 @@ function generate_sweeps(grid_sizes::NTuple{D,Int}, Ns::Int) where D
     return sweeps
 end
 
-# Progress display: one line per source, updated in place
-struct SweepProgress
-    nsrc::Int
+mutable struct StatusLine
     lock::ReentrantLock
-    active::Bool
+    t_start::Float64
+    last_draw::Float64
+    n_done::Int
+    linf::Vector{Float64}   # current L∞ per running source, NaN otherwise
 end
+StatusLine(nsrc) = StatusLine(ReentrantLock(), time(), 0.0, 0, fill(NaN, nsrc))
 
-SweepProgress(nsrc::Int, active::Bool) = SweepProgress(nsrc, ReentrantLock(), active)
-
-function _progress_init!(p::SweepProgress)
-    p.active || return
-    for i in 1:p.nsrc
-        @printf("Source %4d | Iter: %4s | L2: %11s | L∞: %11s\n", i, "—", "—", "—")
-    end
+function _draw(s::StatusLine)
+    running = filter(!isnan, s.linf)
+    @printf("\r\e[2KSweeping: %d/%d done | %d running | max L∞: %.2e | %.0f s",
+            s.n_done, length(s.linf), length(running), maximum(running; init=0.0), time() - s.t_start)
     flush(stdout)
+    s.last_draw = time()
 end
 
-function _progress_update!(p::SweepProgress, isrc::Int, iter::Int, l2::Float64, linf::Float64, note::String="")
-    p.active || return
-    n_up = p.nsrc - isrc + 1
-    lock(p.lock) do
-        print("\e[$(n_up)A\r\e[2K")
-        @printf("Source %4d | Iter: %4d | L2: %.5e | L∞: %.5e", isrc, iter, l2, linf)
-        isempty(note) || print("  ← ", note)
-        print("\e[$(n_up)B\r")
-        flush(stdout)
-    end
+update!(s::StatusLine, isrc, linf) = lock(s.lock) do
+    s.linf[isrc] = linf
+    time() - s.last_draw > 0.1 && _draw(s)
 end
+
+finish!(s::StatusLine, isrc, level, msg) = lock(s.lock) do
+    s.n_done += 1
+    s.linf[isrc] = NaN
+    print("\r\e[2K")       # clear the status line, the log line takes its place
+    @logger level msg
+    _draw(s)               # status line reappears below
+end
+
+# without verbose there is no status line, only the log
+update!(::Nothing, _, _) = nothing
+finish!(::Nothing, _, level, msg) = @logger level msg
 
 # IO
 struct FastSweepResult{D}
@@ -603,14 +608,7 @@ function fast_sweep(
 
     nsrc     = length(sources)
     results  = Vector{FastSweepResult{D}}(undef, nsrc)
-    progress = SweepProgress(nsrc, verbose)
-
-    # While the progress block is shown, per-source log lines are deferred until all sources
-    # are done, otherwise they would be printed into the block and break the in-place updates.
-    deferred = [Tuple{Symbol,String}[] for _ in 1:nsrc]
-    emit(isrc, level, msg) = verbose ? push!(deferred[isrc], (level, msg)) : @logger level msg
-
-    _progress_init!(progress)
+    status   = verbose ? StatusLine(nsrc) : nothing
 
     Threads.@threads for isrc in eachindex(sources)
 
@@ -635,15 +633,14 @@ function fast_sweep(
             end
 
             if any(<(0), t_grid)
-                _progress_update!(progress, isrc, iter, L2_error[end], L∞_error[end], "unstable")
-                emit(isrc, :warn, "Source $isrc unstable at iteration $iter, try larger viscosity_buffer.")
+                finish!(status, isrc, :warn, "Source $isrc unstable at iteration $iter, try larger viscosity_buffer.")
                 break
             end
 
             @. error_buffer = t_grid - t_old
             push!(L2_error, norm(error_buffer, 2))
             push!(L∞_error, norm(error_buffer, Inf))
-            _progress_update!(progress, isrc, iter, L2_error[end], L∞_error[end])
+            update!(status, isrc, L∞_error[end])
 
             if criterion == :L2
                 L2_error[end] < tol && (converged = true; break)
@@ -659,21 +656,16 @@ function fast_sweep(
         time_taken = time() - t_start
         n_iter     = length(L2_error) - 1
         if converged
-            _progress_update!(progress, isrc, n_iter, L2_error[end], L∞_error[end], @sprintf("converged (%.2f s)", time_taken))
-            emit(isrc, :info, @sprintf("Source %d converged after %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
-                                       isrc, n_iter, L2_error[end], L∞_error[end], time_taken))
+            finish!(status, isrc, :info, @sprintf("Source %d converged after %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
+                                                  isrc, n_iter, L2_error[end], L∞_error[end], time_taken))
         elseif n_iter == max_iter
-            _progress_update!(progress, isrc, n_iter, L2_error[end], L∞_error[end], "not converged")
-            emit(isrc, :warn, @sprintf("Source %d did not converge within %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
-                                       isrc, max_iter, L2_error[end], L∞_error[end], time_taken))
+            finish!(status, isrc, :warn, @sprintf("Source %d did not converge within %d iterations | L2: %.5e | L∞: %.5e | %.2f s",
+                                                  isrc, max_iter, L2_error[end], L∞_error[end], time_taken))
         end
 
         results[isrc] = FastSweepResult{D}(t_grid, converged, L2_error, L∞_error, time_taken)
     end
-
-    for msgs in deferred, (level, msg) in msgs
-        @logger level msg
-    end
+    verbose && println()
 
     !isnothing(save) && save_fast_sweep_result(results, save)
 
